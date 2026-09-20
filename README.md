@@ -53,9 +53,10 @@ The sidebar covers: Set up a server, Use the CLI, Build with AI agents, Build a 
 
 | Surface | Extractor |
 | --- | --- |
-| Articles & blog posts | trafilatura, Playwright fallback for JS-heavy pages |
-| YouTube videos | `yt-dlp` + transcript API + optional Whisper audio fallback. `[MM:SS]` timestamps preserved. |
-| LinkedIn / Twitter / X | URL-shape extractors + fxtwitter rewrite |
+| Articles & blog posts | trafilatura; Anysite fetch and browser render for pages that block server IPs |
+| YouTube videos | Caption track via Anysite, title and channel via oembed |
+| LinkedIn / Reddit | Full post via Anysite; LinkedIn videos transcribed with Whisper when enabled |
+| Twitter / X | fxtwitter rewrite |
 | RSS / Atom feeds | `feedparser` + per-item extraction |
 | Newsletter emails | `.eml` parsing, IMAP fetch loop |
 
@@ -64,8 +65,8 @@ All extraction runs server-side. Clients hand over a URL, get JSON back.
 ## What you'll need
 
 - A box to run it on (the reference target is a $4 DigitalOcean droplet)
-- (Recommended) An OpenAI API key — required for semantic search, hybrid-search rerank, chat-with-vault, and YouTube audio fallback. **~$0.02 per 1,000 docs.** Without it, capture + keyword search still work; the rest returns `503`. Roadmap has Ollama / local-model support; PRs welcome.
-- (Optional) A residential proxy for reliable YouTube + X capture from cloud IPs (~$25–50/mo)
+- (Recommended) An OpenAI API key — required for semantic search, hybrid-search rerank, chat-with-vault, and LinkedIn video transcription. **~$0.02 per 1,000 docs.** Without it, capture + keyword search still work; the rest returns `503`. Roadmap has Ollama / local-model support; PRs welcome.
+- (Recommended) An [Anysite](https://anysite.io) API key — required for LinkedIn, YouTube and Reddit capture and for articles behind bot walls. 1 credit per capture, 10 for a browser-rendered page.
 
 See [docs / Set up a server](./docs/quickstart.mdx) for the cost breakdown + privacy data-flow notes.
 

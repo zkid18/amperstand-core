@@ -16,7 +16,8 @@ The server reads its configuration from environment variables (typically via `/e
 
 | Variable | What | Without it |
 | --- | --- | --- |
-| `OPENAI_API_KEY` | Embeddings, hybrid-search rerank, YouTube Whisper fallback | Semantic search returns 503; hybrid search degrades to FTS5-only; YouTube without captions = empty transcript |
+| `OPENAI_API_KEY` | Embeddings, hybrid-search rerank, LinkedIn video transcription | Semantic search returns 503; hybrid search degrades to FTS5-only; LinkedIn videos are saved without a transcript |
+| `ANYSITE_ACCESS_TOKEN` | LinkedIn, YouTube and Reddit capture; fallback fetch for pages that block server IPs | Those captures fail with `422`; plain articles still work |
 
 `OPENAI_API_KEY` is technically optional, but if you're running the server you almost certainly want it. See [embedding setup](/quickstart#3-set-up-embeddings) in the quickstart.
 
@@ -25,35 +26,39 @@ The server reads its configuration from environment variables (typically via `/e
 | Variable | Default | What |
 | --- | --- | --- |
 | `AMPERSTAND_CAPTURE_WORKERS` | `1` | Concurrent async-capture workers |
-| `AMPERSTAND_CAPTURE_JOB_TIMEOUT_S` | `120` | Per-job extraction timeout |
+| `AMPERSTAND_CAPTURE_JOB_TIMEOUT_S` | `90` | Per-job extraction timeout |
+| `AMPERSTAND_CAPTURE_MAX_ATTEMPTS` | `3` | Attempts before a failed capture is marked permanently failed. Retries back off exponentially from 1 minute to 1 hour. |
 | `AMPERSTAND_CHAT_MODEL` | `gpt-4o-mini` | Model used by the chat API (`POST /chat`) |
 | `AMPERSTAND_RERANK_MODEL` | `gpt-4o-mini` | Model used by hybrid-search rerank |
 | `AMPERSTAND_RERANK_ENABLED` | `1` | Set to `0`/`false`/`no` to disable rerank globally |
 
-Bumping `AMPERSTAND_CAPTURE_WORKERS` above 2–3 on a small droplet will trip the OOM-killer during a YouTube burst. Leave it at 1 unless you've sized for it.
+Bumping `AMPERSTAND_CAPTURE_WORKERS` above 2–3 on a small droplet risks the OOM-killer during a burst of large pages. Leave it at 1 unless you've sized for it.
 
-## YouTube
-
-| Variable | Default | What |
-| --- | --- | --- |
-| `AMPERSTAND_YOUTUBE_AUDIO_FALLBACK` | off | Set to `1` to let Whisper transcribe videos with no captions |
-| `AMPERSTAND_YOUTUBE_AUDIO_MAX_SEC` | `3600` | Cap on audio-fallback length (avoids 4-hour podcasts eating your OpenAI bill) |
-
-Audio fallback needs `OPENAI_API_KEY` *and* the `linkedin` extra installed (which bundles `faster-whisper`):
-
-```bash
-pip install "amperstand-core[linkedin]"
-```
-
-(The name is historical — the extra also covers Whisper for YouTube.)
-
-## Outbound proxy (optional)
-
-Some hosts block bots from YouTube / X / LinkedIn. If you have a residential proxy, set:
+## Anysite
 
 | Variable | What |
 | --- | --- |
-| `AMPERSTAND_PROXY_URL` | HTTP(S) proxy URL passed to yt-dlp and trafilatura |
+| `ANYSITE_ACCESS_TOKEN` | API key from [anysite.io](https://anysite.io). Sent as the `access-token` header. |
+
+The server has no browser, media downloader or proxy of its own. Content a plain server-side fetch can't reach comes through Anysite:
+
+| Capture | Anysite endpoint | Credits |
+| --- | --- | --- |
+| LinkedIn post | `/linkedin/post` | 1 |
+| YouTube video | `/youtube/video`, plus `/youtube/video/subtitles` when the record carries no captions | 1–2 |
+| Reddit post | `/reddit/posts` | 1 |
+| Article the direct fetch couldn't get | `/webparser/parse` | 1 |
+| Article still empty or walled after that | `/webparser/render` (real browser) | 10 |
+
+Plain articles are fetched directly first and cost nothing. A `412` from Anysite (post deleted, no caption track) fails the capture without retries; other Anysite failures go through the retry queue. A `401 Token expired` means the Anysite plan the key belongs to has ended, not that the key is old: renew the plan, then replay the failed captures with `POST /jobs/retry-failed`.
+
+## Video transcription
+
+| Variable | Default | What |
+| --- | --- | --- |
+| `AMPERSTAND_AUDIO_TRANSCRIPTION` | off | Set to `1` to transcribe LinkedIn post videos with OpenAI Whisper (~$0.006/min). `AMPERSTAND_YOUTUBE_AUDIO_FALLBACK=1` is accepted as an alias. |
+
+Needs `OPENAI_API_KEY`. A video over 25 MB is saved without a transcript. YouTube is not transcribed: its transcript is the caption track via Anysite, and a video with no captions is saved as a metadata stub.
 
 ## API surface + admin behavior
 

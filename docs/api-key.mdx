@@ -56,7 +56,7 @@ sudo systemctl is-active amperstand-server
 
 ## What both paths do
 
-Both mint a fresh 64-char hex key via `openssl rand -hex 32` (Path B literally, Path A via `secrets.token_hex(32)` which is equivalent). Both do a **surgical line-replace** on `/etc/amperstand/env` — only the `AMPERSTAND_API_KEY=` line changes; comments, other secrets (`OPENAI_API_KEY`, `AMPERSTAND_PROXY_URL`, etc.), and the file's `0640 root:amperstand` ownership are preserved. Both atomically replace the file via `os.rename` so a crash mid-write can't leave you with a half-written env file.
+Both mint a fresh 64-char hex key via `openssl rand -hex 32` (Path B literally, Path A via `secrets.token_hex(32)` which is equivalent). Both do a **surgical line-replace** on `/etc/amperstand/env` — only the `AMPERSTAND_API_KEY=` line changes; comments, other secrets (`OPENAI_API_KEY`, `ANYSITE_ACCESS_TOKEN`, etc.), and the file's `0640 root:amperstand` ownership are preserved. Both atomically replace the file via `os.rename` so a crash mid-write can't leave you with a half-written env file.
 
 ## What both paths do NOT do
 

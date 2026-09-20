@@ -83,7 +83,7 @@ Poll [GET /jobs/{id}](/api-reference/jobs) for status.
 
 ## POST /capture/html
 
-Identical to `/capture` but takes pre-rendered HTML. The browser extension uses this — it grabs the page DOM after JS has run, so heavy SPAs (Substack, Medium archive views) work without server-side Playwright.
+Identical to `/capture` but takes pre-rendered HTML. The browser extension uses this — it grabs the page DOM after JS has run, so heavy SPAs (Substack, Medium archive views) work without a server-side browser render.
 
 ### Additional fields
 

@@ -32,9 +32,10 @@ That's the entire architecture. One server. N clients. HTTP between them.
 
 | Surface | Extractor |
 | --- | --- |
-| Articles & blog posts | trafilatura, Playwright fallback for JS-heavy pages |
-| YouTube videos | `yt-dlp` metadata + transcript API + optional Whisper fallback. Captions are saved with `[MM:SS]` timestamps preserved — good enough to footnote a specific minute in a published piece. |
-| LinkedIn posts | URL-shape extractor |
+| Articles & blog posts | trafilatura; Anysite fetch and browser render for pages that block server IPs |
+| YouTube videos | Caption track via Anysite, title and channel via oembed. No captions → metadata stub. |
+| LinkedIn posts | Full post text via Anysite; post videos transcribed with Whisper when enabled |
+| Reddit posts | Post record via Anysite |
 | Twitter / X | `fxtwitter` rewrite + thread reconstruction |
 | RSS / Atom feeds | `feedparser` + per-item extraction |
 | Newsletter emails | `.eml` parsing, IMAP fetch loop |

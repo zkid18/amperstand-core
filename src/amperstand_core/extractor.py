@@ -9,8 +9,9 @@ import re
 import httpx
 import trafilatura
 
+from amperstand_core import anysite
+from amperstand_core.anysite import AnysiteError
 from amperstand_core.models import CapturedContent, ContentType
-from amperstand_core.proxy import get_proxy
 
 logger = logging.getLogger(__name__)
 
@@ -69,61 +70,16 @@ def is_linkedin_url(url: str) -> bool:
     return any(p.search(url) for p in _LINKEDIN_PATTERNS)
 
 
-def _playwright_proxy_kwargs() -> dict | None:
-    """Translate AMPERSTAND_HTTP_PROXY (user:pass@host:port URL) into the
-    shape playwright expects for chromium.launch(proxy=...). None if no
-    proxy is configured.
+def _fetch_url(url: str) -> str | None:
+    """Fetch URL HTML. Free direct tiers first; Anysite only when they fail.
+
+    Order: trafilatura direct → httpx direct → Anysite static parse (1
+    credit). The browser-rendered tier (10 credits) is not here — it's the
+    retry `extract_article` reaches for once it has seen that the cheaper
+    fetch came back empty or walled, so a page that parses fine never pays
+    for a render.
     """
-    from urllib.parse import urlparse
-
-    raw = get_proxy()
-    if not raw:
-        return None
-    parsed = urlparse(raw)
-    if not parsed.hostname or not parsed.port:
-        return None
-    kwargs: dict = {"server": f"{parsed.scheme or 'http'}://{parsed.hostname}:{parsed.port}"}
-    if parsed.username:
-        kwargs["username"] = parsed.username
-    if parsed.password:
-        kwargs["password"] = parsed.password
-    return kwargs
-
-
-def _fetch_with_playwright(url: str) -> str:
-    """Fetch a page using a headless Chromium browser (JS-rendered).
-
-    Routes through the residential proxy if one is configured — JS-heavy
-    sites often also enforce per-ASN blocks, and a datacenter Chromium hit
-    fails the same way trafilatura would.
-    """
-    from playwright.sync_api import sync_playwright
-
-    launch_kwargs: dict = {"headless": True}
-    proxy_kwargs = _playwright_proxy_kwargs()
-    if proxy_kwargs:
-        launch_kwargs["proxy"] = proxy_kwargs
-        logger.info("playwright launching with proxy=%s", proxy_kwargs["server"])
-
-    with sync_playwright() as p:
-        browser = p.chromium.launch(**launch_kwargs)
-        page = browser.new_page()
-        page.goto(url, wait_until="domcontentloaded", timeout=30_000)
-        # Give JS a moment to render dynamic content
-        page.wait_for_timeout(3000)
-        html = page.content()
-        browser.close()
-    return html
-
-
-def _fetch_url(url: str) -> str:
-    """Fetch URL HTML with multi-tier fallback.
-
-    Order: trafilatura direct → httpx direct → httpx via proxy (if configured)
-    → playwright. The proxy tier is skipped entirely when no proxy is set —
-    direct fetches don't burn proxy bandwidth.
-    """
-    # Tier 1: trafilatura (fast, lightweight, urllib internally — no proxy)
+    # Tier 1: trafilatura (fast, lightweight, urllib internally)
     downloaded = trafilatura.fetch_url(url)
     if downloaded:
         return downloaded
@@ -139,41 +95,35 @@ def _fetch_url(url: str) -> str:
     except httpx.HTTPError as exc:
         logger.debug("httpx (direct) failed for %s: %s", url, exc)
 
-    # Tier 3: httpx via proxy (residential, escapes datacenter IP blocks)
-    via_proxy = _fetch_via_proxy(url)
-    if via_proxy:
-        return via_proxy
-
-    # Tier 4: headless browser (handles JS-rendered pages)
-    logger.info("Using playwright for %s", url)
-    return _fetch_with_playwright(url)
+    # Tier 3: Anysite static parse — their egress, not ours
+    return _fetch_via_anysite(url)
 
 
-def _fetch_via_proxy(url: str) -> str | None:
-    """Fetch via the configured residential proxy. None if no proxy is set
-    or the request fails. Used both as a tier in _fetch_url and as a retry
-    in extract_article when direct fetch returned a block-page that
-    trafilatura.extract couldn't get content out of.
+def _fetch_via_anysite(url: str, *, render: bool = False) -> str | None:
+    """Page HTML via Anysite, or None when it's disabled or came back empty.
+
+    `render=True` executes the page in a real browser on their side (10
+    credits instead of 1) — for JS-only pages and for walls the static
+    fetch can't get past. Anysite's own failures are logged and swallowed
+    here: the caller's "failed to fetch/extract" error is the one the user
+    should see, and the retry queue's attempt budget bounds how often a
+    URL that never works gets tried.
     """
-    proxy = get_proxy()
-    if not proxy:
+    if not anysite.enabled():
         return None
     try:
-        resp = httpx.get(
-            url,
-            headers=_BROWSER_HEADERS,
-            follow_redirects=True,
-            timeout=45,
-            proxy=proxy,
+        rec = anysite.webparser_render(url) if render else anysite.webparser_parse(url)
+    except AnysiteError as exc:
+        logger.info("anysite %s failed for %s: %s", "render" if render else "parse", url, exc)
+        return None
+    html = rec.get("cleaned_html") or ""
+    if html and len(html.strip()) > 200:
+        logger.info(
+            "Fetched %s via anysite %s (%d bytes)",
+            url, "render" if render else "parse", len(html),
         )
-        resp.raise_for_status()
-        if resp.text and len(resp.text.strip()) > 200:
-            logger.info("Fetched %s via proxy (status=%d, %d bytes)",
-                        url, resp.status_code, len(resp.text))
-            return resp.text
-        logger.debug("httpx (proxy) returned thin content for %s", url)
-    except httpx.HTTPError as exc:
-        logger.debug("httpx (proxy) failed for %s: %s", url, exc)
+        return html
+    logger.debug("anysite %s returned thin content for %s", "render" if render else "parse", url)
     return None
 
 
@@ -491,22 +441,22 @@ def extract_article_from_html(
 def extract_article(url: str) -> CapturedContent:
     """Fetch a URL and extract its article content as markdown."""
     downloaded = _fetch_url(url)
-    if not downloaded:
-        raise ValueError(f"Failed to fetch URL: {url}")
+    text = title = author = None
+    if downloaded:
+        text, title, author = _extract_pieces(downloaded)
 
-    text, title, author = _extract_pieces(downloaded)
-
-    # Retry through the residential proxy if the direct fetch came back empty,
-    # trivially short, OR looking like a wall/challenge page. The proxy uses
-    # a residential IP and often gets the real content where the datacenter
-    # IP gets fronted by Cloudflare/captcha/etc.
+    # Retry with a browser render if the cheap fetch came back empty,
+    # trivially short, OR looking like a wall/challenge page. A rendered
+    # page executes the site's JS and arrives from Anysite's IP space, which
+    # gets the real content where a bare server-side GET is fronted by
+    # Cloudflare/captcha/etc.
     needs_retry = (
         not text
         or len(text.strip()) < 200
         or _looks_like_challenge(text, title, downloaded, url=url)
     )
     if needs_retry:
-        retry_html = _fetch_via_proxy(url)
+        retry_html = _fetch_via_anysite(url, render=True)
         if retry_html:
             r_text, r_title, r_author = _extract_pieces(retry_html)
             retry_is_better = (
@@ -515,17 +465,18 @@ def extract_article(url: str) -> CapturedContent:
                 and len(r_text.strip()) > len((text or "").strip())
             )
             if retry_is_better:
-                logger.info("extract via proxy improved content for %s", url)
+                logger.info("extract via anysite render improved content for %s", url)
                 downloaded, text, title, author = retry_html, r_text, r_title, r_author
 
+    if not downloaded:
+        raise ValueError(f"Failed to fetch URL: {url}")
     if not text:
         raise ValueError(f"Failed to extract content from: {url}")
 
     if _looks_like_challenge(text, title, downloaded, url=url):
         raise ValueError(
             f"Anti-bot wall served for {url} — short body / generic title / "
-            f"captcha-widget HTML. Capture aborted; try again later or via "
-            f"a different network."
+            f"captcha-widget HTML. Capture aborted."
         )
 
     # Clean up empty image tags and table artifacts

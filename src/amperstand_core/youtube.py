@@ -1,39 +1,37 @@
 """YouTube transcript and metadata extraction.
 
-Uses two lightweight HTTP APIs that work from datacenter IPs (where yt-dlp
-gets bot-blocked by YouTube's anti-scraping):
+Metadata (title, channel) comes from YouTube's public oembed endpoint, which
+answers datacenter IPs without complaint. Captions come from Anysite, which
+owns the problem of YouTube blocking server IPs — a caption library or media
+downloader running on the box gets blocked, and nothing installed locally
+can change that.
 
-- `oembed`             — public, no auth — for title and channel
-- `youtube-transcript-api` — caption endpoint, often works without cookies
-
-If either fails the function still returns a CapturedContent with whatever
-info we got. yt-dlp is no longer used; YouTube blocks it on cloud IPs with
-"Sign in to confirm you're not a bot" and that path was unreliable.
+When a video has no captions the function raises YouTubeTranscriptUnavailable
+carrying whatever metadata it did get, so the clipper path can still build a
+stub from the watch page's own og:meta.
 """
 
 from __future__ import annotations
 
 import html as _htmllib
 import logging
-import os
 import re
 import urllib.parse
 
 import httpx
 
+from amperstand_core import anysite
+from amperstand_core.anysite import AnysiteError
 from amperstand_core.models import CapturedContent, ContentType
 
 logger = logging.getLogger(__name__)
 
 OEMBED_TIMEOUT = 10
 OEMBED_URL = "https://www.youtube.com/oembed"
-TRANSCRIPT_LANGS = ["en", "ru", "es", "pt", "fr", "de"]
 
-# When set, all YouTube traffic (oembed + transcript fetches) is routed
-# through this proxy. Required when running on a cloud-provider IP that
-# YouTube blocks. Format: http://user:pass@host:port (also supports
-# socks5:// when httpx[socks] is installed).
-PROXY_ENV = "AMPERSTAND_YOUTUBE_PROXY"
+# Language asked for explicitly when the video record's own caption track is
+# empty. Auto-captions exist for nearly every English video.
+FALLBACK_CAPTION_LANG = "en"
 
 
 class YouTubeTranscriptUnavailable(ValueError):
@@ -53,11 +51,6 @@ class YouTubeTranscriptUnavailable(ValueError):
         self.channel_url = channel_url
 
 
-def _proxy_url() -> str | None:
-    raw = os.environ.get(PROXY_ENV, "").strip()
-    return raw or None
-
-
 def extract_youtube(url: str) -> CapturedContent:
     """Extract transcript + metadata from a YouTube URL.
 
@@ -72,57 +65,11 @@ def extract_youtube(url: str) -> CapturedContent:
     channel = meta.get("author_name") or "Unknown"
     channel_url = meta.get("author_url")
 
-    transcript, transcript_lang, transcript_err = _transcript(video_id)
+    record, transcript, lang, reason = _captions(video_id)
+    if record:
+        channel = channel if channel != "Unknown" else (record.get("author") or "Unknown")
 
     if not transcript:
-        # Audio-fallback: download the audio track and run it through
-        # Whisper. Off by default (it costs real money per video).
-        # Enable with AMPERSTAND_YOUTUBE_AUDIO_FALLBACK=1.
-        from amperstand_core.audio import (
-            AudioError,
-            transcribe_youtube,
-            youtube_audio_fallback_enabled,
-        )
-
-        if youtube_audio_fallback_enabled():
-            try:
-                fallback = transcribe_youtube(url, proxy=_proxy_url())
-                transcript = fallback.text
-                transcript_lang = "audio"
-                logger.info(
-                    "audio fallback succeeded for %s (%d chars from %d-byte mp3)",
-                    url, len(transcript), fallback.audio_bytes,
-                )
-            except AudioError as exc:
-                logger.warning("audio fallback failed for %s: %s", url, exc)
-            except Exception:  # noqa: BLE001
-                logger.exception("audio fallback crashed for %s", url)
-
-    if not transcript:
-        # Surfaced 2026-06-13: "YouTube blocked this server's IP" was being
-        # reported when the actual cause was `sudo -u amperstand` stripping
-        # AMPERSTAND_YOUTUBE_PROXY out of the subshell environment. The fetch
-        # then went out from the cloud IP and YT blocked it — accurately
-        # called "ip_blocked" but misleadingly diagnosed. Distinguish based
-        # on whether a proxy was actually visible to this process.
-        if transcript_err == "ip_blocked":
-            if _proxy_url():
-                reason = (
-                    "YouTube blocked even via the configured residential proxy. "
-                    "The proxy's IP may be on YouTube's blocklist — try rotating "
-                    "the residential pool, or use a different provider."
-                )
-            else:
-                reason = (
-                    "YouTube blocked this server's IP and no proxy is "
-                    "configured in this process's environment. "
-                    f"Set {PROXY_ENV} to a residential proxy URL. If you are "
-                    "running this via `sudo -u amperstand`, sudo strips the "
-                    "environment by default — use `sudo -E -u amperstand` or "
-                    "source `/etc/amperstand/env` before invoking."
-                )
-        else:
-            reason = "captions disabled or no track in our languages"
         raise YouTubeTranscriptUnavailable(
             f"No transcript for {url} — {reason}",
             title=title,
@@ -133,11 +80,14 @@ def extract_youtube(url: str) -> CapturedContent:
     lines: list[str] = [f"**Channel**: {channel}"]
     if channel_url:
         lines.append(f"**Channel URL**: {channel_url}")
+    duration = (record or {}).get("duration_seconds")
+    if isinstance(duration, (int, float)) and duration > 0:
+        lines.append(f"**Duration**: {int(duration) // 60} min")
     lines.append("")
-    if transcript_lang:
-        lines.append(f"## Transcript ({transcript_lang})")
-    else:
-        lines.append("## Transcript")
+    description = ((record or {}).get("description") or "").strip()
+    if description:
+        lines += ["## Description", "", description, ""]
+    lines.append(f"## Transcript ({lang})" if lang else "## Transcript")
     lines.append("")
     lines.append(transcript)
 
@@ -148,6 +98,82 @@ def extract_youtube(url: str) -> CapturedContent:
         content_type=ContentType.VIDEO,
         author=channel,
     )
+
+
+def _captions(video_id: str) -> tuple[dict | None, str | None, str | None, str]:
+    """Fetch the video record and a caption track via Anysite.
+
+    Returns (record, transcript, language, reason). The record's own
+    `subtitles` field covers most videos in one call; an explicit request
+    for the fallback language is the second and last credit spent. A 412
+    means "no track", which is a fact about the video and not worth
+    retrying; any other Anysite failure propagates so the retry queue can
+    try again later.
+    """
+    if not video_id:
+        return None, None, None, "could not parse a video id from the URL"
+    if not anysite.enabled():
+        return None, None, None, f"{anysite.TOKEN_ENV} is not set on this server"
+
+    record: dict | None = None
+    try:
+        record = anysite.youtube_video(video_id)
+    except AnysiteError as exc:
+        if exc.status != 412:
+            raise
+        return None, None, None, "video not found or unavailable"
+
+    text = _subtitle_text(record)
+    if text:
+        return record, text, _language_of(record), None
+
+    try:
+        track = anysite.youtube_subtitles(video_id, lang=FALLBACK_CAPTION_LANG)
+    except AnysiteError as exc:
+        if exc.status != 412:
+            raise
+        return record, None, None, "captions disabled or no track in our languages"
+
+    text = _subtitle_text(track)
+    if text:
+        return record, text, _language_of(track) or FALLBACK_CAPTION_LANG, None
+    return record, None, None, "captions disabled or no track in our languages"
+
+
+def _subtitle_text(record: dict) -> str:
+    """Flatten whichever caption shape a record carries into one line of text.
+
+    A track is `{text, language, subtitle_count, subtitles[]}`: the
+    subtitles endpoint returns one at top level, and the video endpoint
+    nests one under its own `subtitles` key. A string, a list of strings or
+    a list of timed lines is also accepted, so a change on their side
+    degrades to "no captions" rather than a crash.
+    """
+    text = record.get("text")
+    if isinstance(text, str) and text.strip():
+        return " ".join(text.split())
+    subs = record.get("subtitles")
+    if isinstance(subs, dict):
+        return _subtitle_text(subs)
+    if isinstance(subs, str):
+        return " ".join(subs.split())
+    if isinstance(subs, list):
+        parts = []
+        for s in subs:
+            piece = s.get("text") if isinstance(s, dict) else s
+            if isinstance(piece, str) and piece.strip():
+                parts.append(" ".join(piece.split()))
+        return " ".join(parts)
+    return ""
+
+
+def _language_of(record: dict) -> str | None:
+    """Language of the track, whether the record is a track or nests one."""
+    lang = record.get("language")
+    if not (isinstance(lang, str) and lang.strip()):
+        nested = record.get("subtitles")
+        lang = nested.get("language") if isinstance(nested, dict) else None
+    return lang if isinstance(lang, str) and lang.strip() else None
 
 
 def youtube_stub_from_html(
@@ -226,7 +252,7 @@ def _video_id(url: str) -> str | None:
         qs = urllib.parse.parse_qs(parsed.query)
         if "v" in qs:
             return qs["v"][0]
-        # /shorts/<id> and /embed/<id>
+        # /shorts/<id>, /embed/<id>, /live/<id>
         parts = parsed.path.strip("/").split("/")
         if len(parts) >= 2 and parts[0] in ("shorts", "embed", "live"):
             return parts[1]
@@ -235,79 +261,15 @@ def _video_id(url: str) -> str | None:
 
 def _oembed(url: str) -> dict:
     """Fetch oembed metadata. Returns {} on failure (don't raise)."""
-    proxy = _proxy_url()
     try:
-        client_kwargs = {
-            "timeout": OEMBED_TIMEOUT,
-            "follow_redirects": True,
-            "headers": {"User-Agent": "Mozilla/5.0 amperstand"},
-        }
-        if proxy:
-            client_kwargs["proxy"] = proxy
-        with httpx.Client(**client_kwargs) as client:
+        with httpx.Client(
+            timeout=OEMBED_TIMEOUT,
+            follow_redirects=True,
+            headers={"User-Agent": "Mozilla/5.0 amperstand"},
+        ) as client:
             r = client.get(OEMBED_URL, params={"url": url, "format": "json"})
         if r.status_code != 200:
             return {}
         return r.json()
     except (httpx.HTTPError, ValueError):
         return {}
-
-
-def _transcript(video_id: str) -> tuple[str | None, str | None, str | None]:
-    """Best-effort transcript fetch via youtube-transcript-api.
-
-    Returns (text, language_code, error_kind). error_kind is one of:
-      - None              when text is present
-      - "ip_blocked"      when YouTube refused the request because of the
-                          source IP (typical for cloud providers)
-      - "no_captions"     when the video has no captions in our preferred
-                          languages, or any other generic failure
-    """
-    if not video_id:
-        return None, None, "no_captions"
-    try:
-        from youtube_transcript_api import YouTubeTranscriptApi
-    except ImportError:
-        return None, None, "no_captions"
-
-    # The lib's specific exception name varies by version; match by class name.
-    try:
-        api = _build_transcript_api()
-        if hasattr(api, "fetch"):
-            fetched = api.fetch(video_id, languages=TRANSCRIPT_LANGS)
-            raw = [{"text": s.text} for s in fetched]
-            lang = getattr(fetched, "language_code", None)
-        else:
-            raw = YouTubeTranscriptApi.get_transcript(  # type: ignore[attr-defined]
-                video_id, languages=TRANSCRIPT_LANGS
-            )
-            lang = None
-    except Exception as exc:  # noqa: BLE001
-        kind = "ip_blocked" if "RequestBlocked" in type(exc).__name__ or "IpBlocked" in type(exc).__name__ else "no_captions"
-        return None, None, kind
-
-    if not raw:
-        return None, lang, "no_captions"
-    text = " ".join(seg.get("text", "").strip() for seg in raw if seg.get("text"))
-    text = text.replace("\n", " ").strip()
-    if not text:
-        return None, lang, "no_captions"
-    return text, lang, None
-
-
-def _build_transcript_api():
-    """Construct a YouTubeTranscriptApi instance, optionally with a proxy."""
-    from youtube_transcript_api import YouTubeTranscriptApi
-
-    proxy = _proxy_url()
-    if not proxy:
-        return YouTubeTranscriptApi()
-    try:
-        from youtube_transcript_api.proxies import GenericProxyConfig
-
-        return YouTubeTranscriptApi(
-            proxy_config=GenericProxyConfig(http_url=proxy, https_url=proxy)
-        )
-    except ImportError:
-        # Older versions of the library lack proxy support — fall back to no proxy
-        return YouTubeTranscriptApi()

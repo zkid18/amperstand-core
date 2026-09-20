@@ -151,6 +151,28 @@ if ! grep -q '^OPENAI_API_KEY=' "$ENV_FILE"; then
     fi
 fi
 
+# Prompt for ANYSITE_ACCESS_TOKEN if not set. Without it, LinkedIn, YouTube
+# and Reddit captures fail and article capture has no fallback for pages
+# that block server IPs — the box has no browser or media tooling of its own.
+if ! grep -q '^ANYSITE_ACCESS_TOKEN=' "$ENV_FILE"; then
+    echo
+    echo "==> Anysite API key (enables LinkedIn, YouTube, Reddit, and walled-page capture)"
+    echo "    Without it those captures fail; plain articles still work."
+    echo "    Paste your key now, or press Enter to skip and add later by editing ${ENV_FILE}."
+    if [ -t 0 ]; then
+        printf "    ANYSITE_ACCESS_TOKEN: "
+        read -r ANYSITE_TOKEN_INPUT
+        if [ -n "${ANYSITE_TOKEN_INPUT:-}" ]; then
+            printf '\nANYSITE_ACCESS_TOKEN=%s\n' "$ANYSITE_TOKEN_INPUT" >> "$ENV_FILE"
+            echo "    ANYSITE_ACCESS_TOKEN added to ${ENV_FILE}."
+        else
+            echo "    Skipped — LinkedIn/YouTube/Reddit capture will fail until you set it."
+        fi
+    else
+        echo "    non-interactive run — skipped. Add ANYSITE_ACCESS_TOKEN to ${ENV_FILE} later."
+    fi
+fi
+
 # Pre-write the CLI's vault-backend config so `sudo -u amperstand amperstand …`
 # works out of the box. Without this, the very first command in the README
 # (`amperstand capture <url>`) errors with "no vault backend configured" because

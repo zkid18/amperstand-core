@@ -1,15 +1,85 @@
-"""Tests for LinkedIn video extraction."""
+"""LinkedIn capture: URL routing and the Anysite-backed extractor."""
 
 from __future__ import annotations
 
-from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
+from amperstand_core.anysite import AnysiteError
+from amperstand_core.audio import AudioError
 from amperstand_core.extractor import is_linkedin_url
-from amperstand_core.linkedin import _parse_webvtt, extract_linkedin
+from amperstand_core.linkedin import extract_linkedin, resolve_post_urn
 from amperstand_core.models import ContentType
+
+
+@pytest.fixture(autouse=True)
+def _no_public_page(monkeypatch: pytest.MonkeyPatch):
+    """Never touch linkedin.com from the suite; tests that exercise the
+    page-based resolution patch this themselves."""
+    monkeypatch.setattr("amperstand_core.linkedin._fetch_public_page", lambda url: None)
+
+
+# ── URL → activity id ────────────────────────────────────────────────
+
+_SHARE_URL = "https://www.linkedin.com/posts/jakesaper_i-have-spent-more-time-writing-about-ai-native-share-7469623060841742336-Ejx0"
+_ACTIVITY_ID = "7469780337284304897"
+_PAGE_WITH_ATTR = (
+    '<meta property="og:url" content="https://www.linkedin.com/posts/jakesaper_slug-activity-'
+    + _ACTIVITY_ID + '-wHyq">'
+    '<article data-attributed-urn="urn:li:share:7469623060841742336" '
+    'data-activity-urn="urn:li:activity:' + _ACTIVITY_ID + '">'
+    '<a href="/feed/update/urn:li:activity:111">related</a>'
+)
+
+
+class TestResolvePostUrn:
+    @pytest.mark.parametrize(
+        "url,expected",
+        [
+            ("https://www.linkedin.com/posts/janedoe_topic-activity-9876543210-wHyq", "activity:9876543210"),
+            ("https://www.linkedin.com/posts/janedoe_topic-activity-9876543210/", "activity:9876543210"),
+            ("https://www.linkedin.com/feed/update/urn:li:activity:9876543210", "activity:9876543210"),
+            ("https://www.linkedin.com/feed/update/urn:li:activity:9876543210/?utm=x", "activity:9876543210"),
+            ("https://www.linkedin.com/embed/feed/update/urn:li:activity:9876543210", "activity:9876543210"),
+        ],
+    )
+    def test_activity_id_in_url_needs_no_fetch(self, url, expected):
+        with patch("amperstand_core.linkedin._fetch_public_page") as fetch:
+            assert resolve_post_urn(url) == expected
+            fetch.assert_not_called()
+
+    def test_share_url_resolves_via_post_element(self):
+        """A share id is not an activity id: Anysite 422s on the share URL
+        and 412s on the share number. The public page carries the real one."""
+        with patch("amperstand_core.linkedin._fetch_public_page", return_value=_PAGE_WITH_ATTR):
+            assert resolve_post_urn(_SHARE_URL) == f"activity:{_ACTIVITY_ID}"
+
+    def test_share_url_falls_back_to_og_url(self):
+        page = _PAGE_WITH_ATTR.replace('data-activity-urn="urn:li:activity:' + _ACTIVITY_ID + '"', "")
+        with patch("amperstand_core.linkedin._fetch_public_page", return_value=page):
+            assert resolve_post_urn(_SHARE_URL) == f"activity:{_ACTIVITY_ID}"
+
+    def test_share_url_falls_back_to_most_frequent_urn(self):
+        page = "urn:li:activity:222 urn:li:activity:333 urn:li:activity:333 urn:li:activity:222 urn:li:activity:333"
+        with patch("amperstand_core.linkedin._fetch_public_page", return_value=page):
+            assert resolve_post_urn(_SHARE_URL) == "activity:333"
+
+    def test_unresolvable_url_passes_through(self):
+        """Login wall, 999, network error or a page without URNs: hand the
+        URL to Anysite unchanged rather than inventing an id."""
+        with patch("amperstand_core.linkedin._fetch_public_page", return_value=None):
+            assert resolve_post_urn(_SHARE_URL) == _SHARE_URL
+        with patch("amperstand_core.linkedin._fetch_public_page", return_value="<html>authwall</html>"):
+            assert resolve_post_urn(_SHARE_URL) == _SHARE_URL
+
+    @patch("amperstand_core.linkedin.anysite.linkedin_post")
+    def test_extractor_spends_the_credit_on_the_resolved_id(self, mock_post):
+        mock_post.return_value = {"author": {"name": "Jake Saper"}, "text": "hi", "video_url": None}
+        with patch("amperstand_core.linkedin._fetch_public_page", return_value=_PAGE_WITH_ATTR):
+            doc = extract_linkedin(_SHARE_URL)
+        mock_post.assert_called_once_with(f"activity:{_ACTIVITY_ID}")
+        assert doc.url == _SHARE_URL
 
 
 # ── URL detection ────────────────────────────────────────────────────
@@ -28,11 +98,8 @@ class TestIsLinkedInUrl:
             "https://www.linkedin.com/embed/feed/update/urn:li:activity:9876543210",
             "https://linkedin.com/posts/user_topic-activity-123456",
             # Modern share URL pattern — no ugcPost/activity marker,
-            # uses share-<digits>-<short_code>. Hit during 2026-06-16
-            # capture of a Jake Saper post; was falling through to
-            # extract_article and saving an empty-body doc.
+            # uses share-<digits>-<short_code>.
             "https://www.linkedin.com/posts/jakesaper_i-have-spent-more-time-writing-about-ai-native-share-7469623060841742336-Ejx0/",
-            # Same shape, no query params
             "https://www.linkedin.com/posts/someone_some-slug-share-1234567890123456789-aBcD/",
         ],
     )
@@ -55,155 +122,121 @@ class TestIsLinkedInUrl:
         assert is_linkedin_url(url) is False
 
 
-# ── Full pipeline (mocked) ──────────────────────────────────────────
+# ── extractor ────────────────────────────────────────────────────────
+
+URL = "https://www.linkedin.com/feed/update/urn:li:activity:7419745318503735296/"
+ACTIVITY_ID = "7419745318503735296"
+
+_TEXT_POST = {
+    "urn": {"type": "activity", "value": "7469122525881532416"},
+    "author": {
+        "name": "Olga Maslikhova", "alias": "olga",
+        "headline": "Founder at TJC", "url": "https://www.linkedin.com/in/olga",
+    },
+    "text": "If I were to start a business in Brazil today, here's what I'd do:\n\n1. Talk to customers.\n2. Ship.",
+    "video_url": None,
+    "images": [],
+}
+
+_VIDEO_POST = {
+    **_TEXT_POST,
+    "author": {"name": "Joe Rhew", "headline": "Applied AI in GTM"},
+    "text": "Every time you use ChatGPT or Claude, you're starting from scratch.\n\nCopy. Paste. Repeat.",
+    "video_url": "https://dms.licdn.com/playlist/vid/v2/D5605AQHGRLQ62vtZnA/mp4-720p-30fp-crf28/0/1769005122566",
+}
 
 
-class TestExtractLinkedIn:
-    @patch("amperstand_core.linkedin._transcribe_video")
-    @patch("amperstand_core.linkedin._download_video")
-    @patch("amperstand_core.linkedin._inspect_post")
-    def test_full_pipeline_with_asr(self, mock_inspect, mock_download, mock_transcribe):
-        """Video URL found, no captions — falls back to ASR."""
-        mock_inspect.return_value = (
-            "https://dms.licdn.com/playlist/vid/v2/xxx/mp4-720p/0/123",
-            None,  # no captions
-            "John Doe on LinkedIn: Great talk about AI",
-            "John Doe",
-            None,  # description (unused for video path)
-        )
-        mock_download.return_value = None
-        mock_transcribe.return_value = "This is a test transcript about AI."
+class TestTextPost:
+    @patch("amperstand_core.linkedin.anysite.linkedin_post", return_value=_TEXT_POST)
+    def test_full_text_not_a_teaser(self, mock_post):
+        doc = extract_linkedin(URL)
 
-        result = extract_linkedin("https://www.linkedin.com/posts/johndoe_activity-123")
+        assert doc.url == URL
+        assert doc.content_type == ContentType.ARTICLE
+        assert doc.author == "Olga Maslikhova"
+        assert doc.title == "Olga Maslikhova on LinkedIn: If I were to start a business in Brazil today, here's what I'd do:"
+        assert "**Author**: Olga Maslikhova — Founder at TJC" in doc.content_markdown
+        # The whole post, not the 150-char og:description.
+        assert "2. Ship." in doc.content_markdown
+        assert "## Transcript" not in doc.content_markdown
+        # The credit is spent on the activity id, never the raw URL.
+        mock_post.assert_called_once_with(f"activity:{ACTIVITY_ID}")
 
-        assert result.content_type == ContentType.VIDEO
-        assert result.title == "John Doe on LinkedIn: Great talk about AI"
-        assert result.author == "John Doe"
-        assert result.url == "https://www.linkedin.com/posts/johndoe_activity-123"
-        assert "**Author**: John Doe" in result.content_markdown
-        assert "## Transcript" in result.content_markdown
-        assert "This is a test transcript about AI." in result.content_markdown
+    @patch("amperstand_core.linkedin.anysite.linkedin_post")
+    def test_long_first_line_is_trimmed_for_title(self, mock_post):
+        mock_post.return_value = {**_TEXT_POST, "text": "word " * 60}
+        doc = extract_linkedin(URL)
+        assert doc.title.endswith("…")
+        assert len(doc.title) < 120
 
-        mock_inspect.assert_called_once()
-        mock_download.assert_called_once()
-        mock_transcribe.assert_called_once()
+    @patch("amperstand_core.linkedin.anysite.linkedin_post")
+    def test_empty_post_still_saves(self, mock_post):
+        mock_post.return_value = {"author": None, "text": None, "video_url": None}
+        doc = extract_linkedin(URL)
+        assert doc.title == "LinkedIn post"
+        assert "*Post has no text.*" in doc.content_markdown
 
-    @patch("amperstand_core.linkedin._fetch_captions")
-    @patch("amperstand_core.linkedin._inspect_post")
-    def test_full_pipeline_with_captions(self, mock_inspect, mock_fetch_captions):
-        """Captions URL found — uses captions, skips ASR."""
-        mock_inspect.return_value = (
-            "https://dms.licdn.com/playlist/vid/v2/xxx/mp4-720p/0/123",
-            "https://dms.licdn.com/playlist/vid/v2/xxx/video-captions-webvtt/0/123",
-            "Jane Smith on LinkedIn: Product launch",
-            "Jane Smith",
-            None,
-        )
-        mock_fetch_captions.return_value = "Welcome to our product launch."
-
-        result = extract_linkedin("https://www.linkedin.com/posts/janesmith_activity-456")
-
-        assert result.content_type == ContentType.VIDEO
-        assert result.author == "Jane Smith"
-        assert "Welcome to our product launch." in result.content_markdown
-        assert "## Transcript" in result.content_markdown
-        mock_fetch_captions.assert_called_once()
+    @patch("amperstand_core.linkedin.anysite.linkedin_post")
+    def test_anysite_failure_propagates(self, mock_post):
+        """A 412 means the post is gone. The server turns this into a 422 and
+        the retry queue must NOT spend attempts on it — so it has to surface
+        as the AnysiteError itself, retryable flag intact."""
+        mock_post.side_effect = AnysiteError("Anysite /api/linkedin/post → 412: Post not found", status=412, retryable=False)
+        with pytest.raises(AnysiteError) as exc:
+            extract_linkedin(URL)
+        assert exc.value.retryable is False
 
 
-class TestNoTranscript:
-    @patch("amperstand_core.linkedin._transcribe_video")
-    @patch("amperstand_core.linkedin._download_video")
-    @patch("amperstand_core.linkedin._inspect_post")
-    def test_empty_transcript_fallback(self, mock_inspect, mock_download, mock_transcribe):
-        mock_inspect.return_value = (
-            "https://dms.licdn.com/playlist/vid/v2/xxx/mp4-720p/0/123",
-            None,
-            "LinkedIn Video",
-            None,
-            None,
-        )
-        mock_download.return_value = None
-        mock_transcribe.return_value = ""
+class TestVideoPost:
+    @patch("amperstand_core.linkedin.anysite.linkedin_post", return_value=_VIDEO_POST)
+    def test_transcription_off_keeps_text_and_flags_video(self, mock_post, monkeypatch):
+        monkeypatch.delenv("AMPERSTAND_AUDIO_TRANSCRIPTION", raising=False)
+        monkeypatch.delenv("AMPERSTAND_YOUTUBE_AUDIO_FALLBACK", raising=False)
 
-        result = extract_linkedin("https://www.linkedin.com/posts/user_activity-456")
+        doc = extract_linkedin(URL)
 
-        assert result.content_type == ContentType.VIDEO
-        assert "## Transcript" not in result.content_markdown
-        assert "*No speech detected in video.*" in result.content_markdown
-        assert "**Author**" not in result.content_markdown
+        assert doc.content_type == ContentType.VIDEO
+        assert "Copy. Paste. Repeat." in doc.content_markdown
+        assert "*Includes a video (not transcribed).*" in doc.content_markdown
+        assert "## Transcript" not in doc.content_markdown
 
+    @patch("amperstand_core.linkedin.transcribe_audio_file", return_value="Hello from the video.")
+    @patch("amperstand_core.linkedin.download_media", return_value=1234)
+    @patch("amperstand_core.linkedin.anysite.linkedin_post", return_value=_VIDEO_POST)
+    def test_transcribed_when_enabled(self, mock_post, mock_dl, mock_whisper, monkeypatch):
+        monkeypatch.setenv("AMPERSTAND_AUDIO_TRANSCRIPTION", "1")
 
-class TestTextPostStub:
-    """No video stream — fall back to og:meta stub instead of raising 422."""
+        doc = extract_linkedin(URL)
 
-    @patch("amperstand_core.linkedin._inspect_post")
-    def test_text_post_with_description(self, mock_inspect):
-        mock_inspect.return_value = (
-            None,  # no video
-            None,  # no captions
-            "Olga Maslikhova on LinkedIn: Another billion dollar business idea",
-            "Olga Maslikhova",
-            "If I were to start a business in Brazil today, here's what I'd do:",
-        )
+        assert doc.content_type == ContentType.VIDEO
+        assert "## Transcript" in doc.content_markdown
+        assert "Hello from the video." in doc.content_markdown
+        assert mock_dl.call_args.args[0] == _VIDEO_POST["video_url"]
 
-        result = extract_linkedin(
-            "https://www.linkedin.com/feed/update/urn:li:activity:7469122525881532416/"
-        )
+    @patch("amperstand_core.linkedin.transcribe_audio_file")
+    @patch("amperstand_core.linkedin.download_media", return_value=1234)
+    @patch("amperstand_core.linkedin.anysite.linkedin_post", return_value=_VIDEO_POST)
+    def test_legacy_youtube_env_name_still_enables(self, mock_post, mock_dl, mock_whisper, monkeypatch):
+        monkeypatch.delenv("AMPERSTAND_AUDIO_TRANSCRIPTION", raising=False)
+        monkeypatch.setenv("AMPERSTAND_YOUTUBE_AUDIO_FALLBACK", "1")
+        mock_whisper.return_value = "legacy ok"
+        assert "legacy ok" in extract_linkedin(URL).content_markdown
 
-        assert result.content_type == ContentType.ARTICLE
-        assert result.author == "Olga Maslikhova"
-        assert "**Author**: Olga Maslikhova" in result.content_markdown
-        assert "business in Brazil" in result.content_markdown
-        assert "## Transcript" not in result.content_markdown
+    @patch("amperstand_core.linkedin.download_media", side_effect=AudioError("media exceeds 25MB Whisper limit"))
+    @patch("amperstand_core.linkedin.anysite.linkedin_post", return_value=_VIDEO_POST)
+    def test_oversized_video_degrades_to_text(self, mock_post, mock_dl, monkeypatch):
+        monkeypatch.setenv("AMPERSTAND_AUDIO_TRANSCRIPTION", "1")
 
-    @patch("amperstand_core.linkedin._inspect_post")
-    def test_text_post_no_description_falls_back_to_hint(self, mock_inspect):
-        mock_inspect.return_value = (None, None, "LinkedIn post", None, None)
+        doc = extract_linkedin(URL)
 
-        result = extract_linkedin("https://www.linkedin.com/feed/update/urn:li:activity:999/")
+        assert doc.content_type == ContentType.VIDEO
+        assert "Copy. Paste. Repeat." in doc.content_markdown
+        assert "not transcribed" in doc.content_markdown
 
-        assert result.content_type == ContentType.ARTICLE
-        assert "not visible without authentication" in result.content_markdown.lower()
-
-
-# ── WebVTT parsing ──────────────────────────────────────────────────
-
-
-class TestParseWebVTT:
-    def test_basic_vtt(self):
-        vtt = """WEBVTT
-
-1
-00:00:00.000 --> 00:00:02.500
-Hello everyone.
-
-2
-00:00:02.500 --> 00:00:05.000
-Welcome to the presentation.
-"""
-        assert _parse_webvtt(vtt) == "Hello everyone. Welcome to the presentation."
-
-    def test_deduplicates_lines(self):
-        vtt = """WEBVTT
-
-00:00:00.000 --> 00:00:02.000
-Hello
-
-00:00:02.000 --> 00:00:04.000
-Hello
-
-00:00:04.000 --> 00:00:06.000
-World
-"""
-        assert _parse_webvtt(vtt) == "Hello World"
-
-    def test_strips_html_tags(self):
-        vtt = """WEBVTT
-
-00:00:00.000 --> 00:00:02.000
-<b>Bold text</b> and <i>italic</i>
-"""
-        assert _parse_webvtt(vtt) == "Bold text and italic"
-
-    def test_empty_vtt(self):
-        assert _parse_webvtt("WEBVTT\n\n") == ""
+    @patch("amperstand_core.linkedin.transcribe_audio_file", side_effect=RuntimeError("openai down"))
+    @patch("amperstand_core.linkedin.download_media", return_value=1234)
+    @patch("amperstand_core.linkedin.anysite.linkedin_post", return_value=_VIDEO_POST)
+    def test_unexpected_whisper_crash_does_not_lose_the_post(self, mock_post, mock_dl, mock_whisper, monkeypatch):
+        monkeypatch.setenv("AMPERSTAND_AUDIO_TRANSCRIPTION", "1")
+        doc = extract_linkedin(URL)
+        assert "Copy. Paste. Repeat." in doc.content_markdown

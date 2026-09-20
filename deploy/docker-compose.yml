@@ -6,6 +6,8 @@
 #   echo "AMPERSTAND_API_KEY=$(openssl rand -hex 32)" > .env
 #   # Optional, for /chat + semantic + hybrid search:
 #   echo "OPENAI_API_KEY=sk-..." >> .env
+#   # Required for LinkedIn / YouTube / Reddit capture and walled pages:
+#   echo "ANYSITE_ACCESS_TOKEN=..." >> .env
 #   docker compose up -d
 #   docker compose logs -f
 #
@@ -30,8 +32,8 @@ services:
       AMPERSTAND_API_KEY: ${AMPERSTAND_API_KEY:?set AMPERSTAND_API_KEY in .env}
       AMPERSTAND_DATA_DIR: /var/lib/amperstand/vault
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
-      AMPERSTAND_HTTP_PROXY: ${AMPERSTAND_HTTP_PROXY:-}
-      AMPERSTAND_YOUTUBE_AUDIO_FALLBACK: ${AMPERSTAND_YOUTUBE_AUDIO_FALLBACK:-}
+      ANYSITE_ACCESS_TOKEN: ${ANYSITE_ACCESS_TOKEN:-}
+      AMPERSTAND_AUDIO_TRANSCRIPTION: ${AMPERSTAND_AUDIO_TRANSCRIPTION:-}
     volumes:
       - vault:/var/lib/amperstand
     expose:

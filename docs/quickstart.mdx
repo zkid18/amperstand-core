@@ -20,15 +20,15 @@ Most of Amperstand's features need third-party APIs you bring yourself. Be hones
 | **Embeddings** (semantic + hybrid search) | `text-embedding-3-small` | ~$0.02 per 1,000 docs at capture time |
 | **Hybrid-search rerank** (default behavior; deep-research skill leans on it) | `gpt-4o-mini` | ~$0.001 per query |
 | **Chat-with-vault** (`/chat` — notebook UI) | `gpt-4o-mini` | ~$0.001 per chat turn |
-| **YouTube audio-fallback transcripts** (opt-in via `AMPERSTAND_YOUTUBE_AUDIO_FALLBACK=1`) | OpenAI Whisper | ~$0.006/min of audio |
+| **LinkedIn video transcripts** (opt-in via `AMPERSTAND_AUDIO_TRANSCRIPTION=1`) | OpenAI Whisper | ~$0.006/min of audio |
 
-**Without `OPENAI_API_KEY`:** capture + keyword search still work; semantic + hybrid + chat return `503`; YouTube without captions returns a metadata stub.
+**Without `OPENAI_API_KEY`:** capture + keyword search still work; semantic + hybrid + chat return `503`; LinkedIn videos are saved without a transcript.
 
 **Privacy note.** Embedding sends doc bodies to OpenAI at capture time. Hybrid rerank sends queries + retrieved passages. If your corpus is confidential, set `OPENAI_API_KEY` to empty and live with keyword-only search. There's no local-model alternative built yet (Ollama / sentence-transformers on the roadmap; PRs welcome).
 
-### Residential proxy — required for YouTube & X reliably
+### Anysite API — required for LinkedIn, YouTube and Reddit
 
-DigitalOcean and most cloud hosts are rate-limited or blocked by YouTube's transcript API, Twitter/X, and Cloudflare-walled sites. From a home IP this is often fine; from a droplet, expect intermittent capture failures unless you route outbound through a residential proxy. ~$25–50/mo for Webshare/Bright Data/IPRoyal, or run your own. Set `AMPERSTAND_PROXY_URL` in the env file. Skip and tolerate the failure rate if you don't capture much YouTube/X.
+Cloud hosts are blocked by LinkedIn and YouTube and walled by Cloudflare-fronted sites. The server delegates those fetches to [Anysite](https://anysite.io): 1 credit per LinkedIn post, YouTube video or Reddit post, 10 for a browser-rendered article page. Set `ANYSITE_ACCESS_TOKEN` in the env file. Without it those captures fail; plain articles still work. Per-endpoint detail in [Configuration](/configuration#anysite).
 
 ## Step 0: Get an Ubuntu host (if you don't have one)
 
@@ -115,11 +115,11 @@ Add the keys you need:
 # For semantic + hybrid + chat + Whisper (see "what depends on what" above)
 OPENAI_API_KEY=sk-...
 
-# For YouTube + X capture reliability
-AMPERSTAND_PROXY_URL=http://user:pass@residential-proxy-host:port
+# For LinkedIn, YouTube, Reddit, and walled-page capture
+ANYSITE_ACCESS_TOKEN=...
 
-# Opt-in to Whisper transcription for videos without captions
-AMPERSTAND_YOUTUBE_AUDIO_FALLBACK=1
+# Opt-in to Whisper transcription of LinkedIn post videos
+AMPERSTAND_AUDIO_TRANSCRIPTION=1
 ```
 
 Save (`Ctrl-O`, `Enter`, `Ctrl-X`) and restart:
