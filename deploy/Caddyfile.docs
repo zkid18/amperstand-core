@@ -18,6 +18,11 @@
     encode gzip zstd
     header -Server
     root * /var/www/amperstand-docs
+    # Pages revalidate on every visit (ETag makes that a 304), so a republish
+    # shows up immediately; hashed build assets never change under one name.
+    @assets path /_next/static/*
+    header @assets Cache-Control "public, max-age=31536000, immutable"
+    header ?Cache-Control "no-cache"
     try_files {path} {path}/index.html {path}.html
     file_server
 }
