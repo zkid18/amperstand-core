@@ -1,76 +1,77 @@
 ---
 title: Introduction
-description: "Self-hosted personal vault. Capture URLs, YouTube, RSS, and newsletters from any client into one searchable store."
+description: "Save articles, videos, newsletters and posts as markdown files you own, on a server you run. Search them yourself or from your AI agents."
 ---
 
-## What it is
+Amperstand is a self-hosted read-it-later and research vault. You send it a link from your browser, your phone or a script; it saves the readable content as a markdown file on a machine you control and indexes it for search. Your notes app, your scripts and your AI agents read the same files through one HTTP API.
 
-Amperstand is a **self-hosted personal vault**. It has two parts you need to understand:
+## What you can do
 
-1. **The server (`amperstand-core`)** — the only thing that touches your data. Runs on a box you control: a $4 droplet, a home NAS, even localhost. Exposes a REST API.
-2. **Clients (anything that speaks HTTP to the server)** — the official CLI (`amperstand`), a Telegram bot, a Chrome extension, your own agent code. Capture surfaces, query surfaces, integration glue. The bot and extension aren't special — they're just two HTTP clients we ship as reference implementations. You can replace either of them, or add a fifth client tomorrow, and the server doesn't care.
-
-That's the entire architecture. One server. N clients. HTTP between them.
-
-## Architecture
-
-```
-   ┌───────────┐   ┌──────────────┐   ┌────────────┐   ┌─────────────┐
-   │    CLI    │   │ Telegram bot │   │ Chrome ext │   │  anything   │
-   └─────┬─────┘   └──────┬───────┘   └──────┬─────┘   └──────┬──────┘
-         │                │                  │                │
-         └────────────────┴────────┬─────────┴────────────────┘
-                                   │  HTTP + API key
-                           ┌───────▼──────────┐
-                           │  amperstand-core │
-                           └──────────────────┘
-```
-
-**Clients are interchangeable.** Today we ship a CLI, a Telegram bot, and a Chrome extension. Build a Discord bot, an iOS Shortcut, an n8n flow — the server doesn't care which client made the request.
+- **Capture from anywhere.** One click in Chrome, a link pasted into a Telegram chat, `amperstand capture <url>` in a terminal, or a POST from any script. Everything lands in the same vault.
+- **Keep the content, not the bookmark.** Each capture is the full readable text with title, author and date in YAML frontmatter, as a plain markdown file. Open the folder in Obsidian, grep it, back it up. If you stop using the tool, the files stay.
+- **Search it.** Keyword search works with no extra setup. With an OpenAI key you also get semantic and hybrid search, and chat over the vault.
+- **Feed it to agents.** The vault is a corpus your agents query through the API, whether from a skill, a system prompt or a shell-out.
+- **Follow sources.** Subscribe to RSS and Atom feeds and to a newsletter mailbox; new items are captured on a schedule.
 
 ## What it captures
 
-| Surface | Extractor |
+| You send | What is saved |
 | --- | --- |
-| Articles & blog posts | trafilatura, Playwright fallback for JS-heavy pages |
-| YouTube videos | `yt-dlp` metadata + transcript API + optional Whisper fallback. Captions are saved with `[MM:SS]` timestamps preserved — good enough to footnote a specific minute in a published piece. |
-| LinkedIn posts | URL-shape extractor |
-| Twitter / X | `fxtwitter` rewrite + thread reconstruction |
-| RSS / Atom feeds | `feedparser` + per-item extraction |
-| Newsletter emails | `.eml` parsing, IMAP fetch loop |
+| Article or blog post URL | Readable text with title, author and publication date. JavaScript-heavy pages are rendered before extraction. |
+| YouTube URL | Title, channel, description and the transcript when captions exist, with optional Whisper transcription when they don't. |
+| LinkedIn post URL | The post text and author. |
+| X / Twitter URL | The post text and author. |
+| RSS or Atom feed | Every new entry, captured as an article. |
+| Newsletter email | The email body as markdown, pulled from a mailbox the server watches over IMAP. |
+| Page HTML from the browser extension | The article extracted from the page as you saw it, including pages behind your own login. |
 
-All extraction runs **on the server**. Clients just hand over a URL (or HTML, or an .eml file) and wait for the result.
+Extraction runs on the server. Clients only hand over a URL or the page HTML.
 
-## Why this shape
+## How it fits together
 
-- **One vault, many clients.** Capture from your phone via Telegram, one-click from the browser, batch from a script — everything lands in the same searchable store.
-- **Data sovereignty.** The vault is plain markdown files on a server you own. The tool can disappear; the files don't.
-- **Stable surface.** The HTTP API is the contract. Build any client in any language. Your own agents query the same endpoints the bot does.
+One server, any number of clients, HTTP with an API key between them.
 
-## Set up your server
+```
+   CLI        Telegram bot     Chrome extension     your own client
+    └──────────────┴──────────────────┴───────────────────┘
+                              HTTP + API key
+                          ┌─────────────────┐
+                          │ amperstand-core │  markdown files + search index
+                          └─────────────────┘
+```
+
+- **The server** (`amperstand-core`) is the only component that touches your data. It runs on any Linux machine you control, from a small VPS to a home server or your laptop. It stores the vault as markdown files plus a SQLite index, and it exposes the HTTP API.
+- **Clients** are anything that speaks HTTP. The CLI, the Telegram bot and the Chrome extension are reference clients. A Discord bot, an iOS Shortcut or an n8n flow can do the same job through the API.
+
+## What you need
+
+- A Linux host with Python 3.10 or newer, or Docker.
+- An OpenAI API key for semantic search, hybrid search, chat and audio transcription. Without it, capture and keyword search work and those features return `503`.
+
+## Start here
 
 <CardGroup cols={2}>
-  <Card title="Bare-metal install (one page)" icon="rocket" href="/quickstart">
-    Clone, run `bootstrap.sh`, capture a URL. One canonical path with an expandable DigitalOcean walkthrough for first-timers. ~10 min if you have a host, ~30 if you're starting from scratch.
+  <Card title="Set up a server" icon="rocket" href="/quickstart">
+    Clone, run `bootstrap.sh`, capture a URL. Includes a walkthrough for a first VPS.
   </Card>
   <Card title="Docker Compose" icon="docker" href="/server-install-docker">
-    `docker compose up -d`. Homelab-friendly; drops into your existing compose stack.
+    `docker compose up -d` on a host you already run.
   </Card>
 </CardGroup>
 
-Once your server is up:
+Once the server is up:
 
 <CardGroup cols={2}>
   <Card title="Install the CLI" icon="terminal" href="/cli-install">
     `pip install amperstand`, point it at your server.
   </Card>
-  <Card title="Use the CLI (start here)" icon="play" href="/cli-quickstart">
-    The six things to know how to do. Capture, search, subscribe to a feed, read a doc back.
+  <Card title="Use the CLI" icon="play" href="/cli-quickstart">
+    Capture, search, subscribe to a feed, read a doc back.
   </Card>
   <Card title="Plug it into an AI agent" icon="robot" href="/agents-overview">
-    Make your vault the corpus your agent queries. Skills, system prompts, shell-out — three patterns.
+    Make the vault the corpus your agent queries.
   </Card>
   <Card title="Build a custom client" icon="code" href="/examples/build-your-own">
-    The HTTP API is the contract. Any language, any tool.
+    The HTTP API is the contract. Any language.
   </Card>
 </CardGroup>

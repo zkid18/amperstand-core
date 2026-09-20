@@ -2,7 +2,7 @@
   "$schema": "https://mintlify.com/docs.json",
   "theme": "mint",
   "name": "Amperstand",
-  "description": "Self-hosted personal vault. Capture URLs, YouTube, RSS, and newsletters into a searchable store any client can query.",
+  "description": "Save articles, videos, newsletters and posts as markdown files you own, on a server you run. Search them yourself or from your AI agents.",
   "colors": {
     "primary": "#0F172A",
     "light": "#3B82F6",
