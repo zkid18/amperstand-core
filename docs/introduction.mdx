@@ -9,7 +9,7 @@ Amperstand is a self-hosted read-it-later and research vault. You send it a link
 
 - **Capture from anywhere.** One click in Chrome, a link pasted into a Telegram chat, `amperstand capture <url>` in a terminal, or a POST from any script. Everything lands in the same vault.
 - **Keep the content, not the bookmark.** Each capture is the full readable text with title, author and date in YAML frontmatter, as a plain markdown file. Open the folder in Obsidian, grep it, back it up. If you stop using the tool, the files stay.
-- **Search it.** Keyword search works with no extra setup. With an OpenAI key you also get semantic and hybrid search, and chat over the vault.
+- **Search inside the content.** Every doc is indexed section by section, so a hit is a passage with its heading path, not a title. Full-text search finds exact terms. Semantic search finds passages that share meaning but not words. Hybrid search fuses both and can rerank the top candidates with an LLM, which is what answers "that post about…" queries. Chat over the vault runs on the same index. Full-text needs no setup; the other modes use an OpenAI key.
 - **Feed it to agents.** The vault is a corpus your agents query through the API, whether from a skill, a system prompt or a shell-out.
 - **Follow sources.** Subscribe to RSS and Atom feeds and to a newsletter mailbox; new items are captured on a schedule.
 
