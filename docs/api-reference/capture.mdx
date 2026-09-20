@@ -68,7 +68,7 @@ If `persist: false`, `id` / `path` / `body_hash` are `null`.
 
 ### Errors
 
-- **422** — URL unreachable, content empty, extractor crashed
+- **422** — URL unreachable, content empty, extractor crashed. The capture is queued for retry and `detail` names the job; see [Jobs](/api-reference/jobs).
 - **500** — extracted OK but couldn't write to the vault (rare; usually a permissions issue)
 
 ## POST /capture/async

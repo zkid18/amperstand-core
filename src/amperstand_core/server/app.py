@@ -34,6 +34,7 @@ from amperstand_core.server.capture_jobs import (
     STATUS_QUEUED,
     STATUS_RUNNING,
     JobStore,
+    backoff_seconds,
 )
 from amperstand_core.server.chat_api import router as chat_router
 from amperstand_core.server.feed_api import router as feed_router
@@ -114,7 +115,7 @@ def _job_timeout_s() -> float:
     """Per-job wall-clock budget for extract+persist. Anything slower gets
     marked failed and the worker moves on. F2 from the queue e2e report:
     a single 62s httpbin failure stalled the line behind it. Configurable
-    so you can bump it for heavy YouTube/Playwright loads."""
+    so you can bump it for slow renders or long Whisper jobs."""
     raw = os.environ.get("AMPERSTAND_CAPTURE_JOB_TIMEOUT_S", "").strip()
     try:
         v = float(raw) if raw else 90.0
@@ -123,6 +124,54 @@ def _job_timeout_s() -> float:
         return max(10.0, min(v, 600.0))
     except ValueError:
         return 90.0
+
+
+def _max_attempts() -> int:
+    """How many times a capture may be tried before the queue gives up on it.
+
+    Three is enough to ride out the failures that actually resolve themselves —
+    a rate limit, a flaky origin, a proxy hiccup — without grinding forever on a
+    URL that is simply gone. Operators who fixed something server-side don't
+    need a bigger budget; they need POST /jobs/retry-failed, which hands every
+    dead job a fresh one."""
+    raw = os.environ.get("AMPERSTAND_CAPTURE_MAX_ATTEMPTS", "").strip()
+    try:
+        v = int(raw) if raw else 3
+        return max(1, min(v, 10))
+    except ValueError:
+        return 3
+
+
+async def _record_attempt_failure(
+    store: JobStore, job_id: str, worker_id: int, error: str, *, retryable: bool = True,
+) -> None:
+    """Book a failed attempt against a job and log which way it went.
+
+    The worker never decides retry policy itself — JobStore.fail_or_requeue
+    owns the attempt budget and the backoff, so the sync endpoints and the
+    worker can't drift apart on it. The one exception is an extractor that
+    has declared the failure permanent (`retryable=False`): that goes
+    straight to failed without spending the remaining attempts."""
+    if not retryable:
+        await asyncio.to_thread(store.mark_failed, job_id, error)
+        log.warning(
+            "capture-worker[%d]: job %s failed permanently (not retryable): %s",
+            worker_id, job_id, error,
+        )
+        return
+    status, next_at = await asyncio.to_thread(
+        store.fail_or_requeue, job_id, error, max_attempts=_max_attempts(),
+    )
+    if status == STATUS_QUEUED:
+        log.warning(
+            "capture-worker[%d]: job %s failed, requeued for %s: %s",
+            worker_id, job_id, next_at, error,
+        )
+    else:
+        log.warning(
+            "capture-worker[%d]: job %s failed permanently after %d attempts: %s",
+            worker_id, job_id, _max_attempts(), error,
+        )
 
 
 async def _capture_worker(stop: asyncio.Event, *, worker_id: int = 0) -> None:
@@ -176,15 +225,83 @@ async def _capture_worker(stop: asyncio.Event, *, worker_id: int = 0) -> None:
                 "marking failed and moving on (thread continues in background)",
                 worker_id, job_id, timeout,
             )
-            await asyncio.to_thread(
-                store.mark_failed, job_id,
+            await _record_attempt_failure(
+                store, job_id, worker_id,
                 f"Job exceeded {timeout:.0f}s budget — extractor stalled. "
                 "Try again later or increase AMPERSTAND_CAPTURE_JOB_TIMEOUT_S.",
             )
         except Exception as e:  # noqa: BLE001
             log.exception("capture-worker[%d]: job %s failed", worker_id, job_id)
-            await asyncio.to_thread(store.mark_failed, job_id, f"{type(e).__name__}: {e}")
+            await _record_attempt_failure(
+                store, job_id, worker_id, f"{type(e).__name__}: {e}",
+                retryable=getattr(e, "retryable", True),
+            )
     log.info("capture-worker[%d]: stopped", worker_id)
+
+
+def _enroll_failed_capture(
+    url: str,
+    error: Exception,
+    *,
+    persist: bool,
+    frontmatter: dict[str, Any] | None = None,
+    html: str | None = None,
+    fallback_title: str | None = None,
+) -> str | None:
+    """Hand a failed synchronous capture to the retry queue.
+
+    The sync endpoints still answer their caller immediately with the failure,
+    but the URL itself is worth keeping: most capture failures are the server
+    being temporarily wrong, not the link being bad. Enrolling the attempt here
+    means fixing the server drains the backlog, instead of the user having to
+    remember what they lost. Before this, a failed /capture left no trace
+    anywhere — not in the vault, not in the queue, not in the log.
+
+    Returns the job id, or None if the URL could not be queued.
+    """
+    detail = f"{type(error).__name__}: {error}"
+    if getattr(error, "retryable", True) is False:
+        # The extractor has said this failure is a property of the URL, not
+        # of the moment (a post that doesn't exist, a rejected token). No
+        # number of retries changes that, so record it and stop.
+        log.warning("capture failed for %s: %s (not retryable, not queued)", url, detail)
+        return None
+    try:
+        store = _job_store()
+        existing = store.find_active_by_url(url)
+        if existing is not None:
+            # Someone re-sending a failing link by hand shouldn't stack up
+            # duplicate rows — the one already in flight covers it.
+            log.warning(
+                "capture failed for %s: %s (already queued as job %s)",
+                url, detail, existing["id"],
+            )
+            return existing["id"]
+        job_id = store.enqueue(
+            url,
+            persist=persist,
+            frontmatter=frontmatter,
+            html=html,
+            fallback_title=fallback_title,
+            error=detail,
+            attempts=1,
+            delay_s=backoff_seconds(1),
+        )
+    except Exception:  # noqa: BLE001
+        # The queue is a safety net, not the contract. If SQLite is unhappy we
+        # still owe the caller the real error, so log and carry on.
+        log.exception("capture failed for %s and could not be queued: %s", url, detail)
+        return None
+    log.warning(
+        "capture failed for %s: %s (queued for retry as job %s)", url, detail, job_id,
+    )
+    return job_id
+
+
+def _with_job_hint(message: str, job_id: str | None) -> str:
+    """Append the retry job id to an error, so the response reads as
+    'we will try this again' rather than 'your link is gone'."""
+    return f"{message} (queued for retry as job {job_id})" if job_id else message
 
 
 def _env_bool(name: str) -> bool:
@@ -271,7 +388,7 @@ def create_app(*, docs_visible: bool | None = None) -> FastAPI:
             yield
         finally:
             # Graceful shutdown — F4 from the queue e2e report: the previous
-            # 10s wait_for + task.cancel() was too aggressive; mid-Playwright
+            # 10s wait_for + task.cancel() was too aggressive; mid-fetch
             # jobs run on a thread that ignores asyncio cancellation, and
             # systemd then SIGKILL'd the process ~20s later. Better path:
             # signal the workers (which exit at the top of the next loop
@@ -423,14 +540,25 @@ def create_app(*, docs_visible: bool | None = None) -> FastAPI:
         try:
             content = _dispatch(req.url, html=None, fallback_title=None)
         except Exception as e:
-            raise HTTPException(status_code=422, detail=str(e))
+            job_id = _enroll_failed_capture(
+                req.url, e, persist=req.persist, frontmatter=req.frontmatter,
+            )
+            raise HTTPException(status_code=422, detail=_with_job_hint(str(e), job_id))
 
         doc_id = doc_path = body_hash = None
         if req.persist:
             try:
                 doc_id, doc_path, body_hash = _persist_capture(content, req.frontmatter)
             except Exception as e:
-                raise HTTPException(status_code=500, detail=f"capture extracted but persist failed: {e}")
+                job_id = _enroll_failed_capture(
+                    req.url, e, persist=req.persist, frontmatter=req.frontmatter,
+                )
+                raise HTTPException(
+                    status_code=500,
+                    detail=_with_job_hint(
+                        f"capture extracted but persist failed: {e}", job_id,
+                    ),
+                )
 
         return CaptureResponse(
             title=content.title,
@@ -505,13 +633,59 @@ def create_app(*, docs_visible: bool | None = None) -> FastAPI:
     ) -> dict:
         """List jobs, newest first. Useful for the extension's 'recent clips'
         view and for operators inspecting queue depth."""
-        rows = _job_store().list(status=status, limit=limit)
+        store = _job_store()
+        rows = store.list(status=status, limit=limit)
         for r in rows:
             r.pop("html", None)
         return {
             "items": rows,
-            "queue_depth": _job_store().queue_depth(),
+            "queue_depth": store.queue_depth(),
+            # Per-status totals across the whole table, not just this page —
+            # the cheapest way to spot a retry backlog building up.
+            "counts": store.status_counts(),
         }
+
+    @app.post(
+        "/jobs/{job_id}/retry",
+        dependencies=[Depends(require_api_key)],
+    )
+    def retry_job(job_id: str) -> dict:
+        """Re-arm one permanently-failed job with a fresh attempt budget.
+
+        For the case where you know why it failed and you know it's fixed —
+        no point waiting for a backoff that already expired."""
+        store = _job_store()
+        row = store.get(job_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="job not found")
+        if row["status"] != STATUS_FAILED:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"job is {row['status']}, not {STATUS_FAILED} — "
+                    "only permanently-failed jobs can be re-armed"
+                ),
+            )
+        store.retry(job_id)
+        log.info("capture-jobs: job %s re-armed", job_id)
+        return {"job_id": job_id, "status": STATUS_QUEUED, "url": row["url"]}
+
+    @app.post(
+        "/jobs/retry-failed",
+        dependencies=[Depends(require_api_key)],
+    )
+    def retry_failed_jobs(
+        limit: int | None = Query(default=None, ge=1, le=1000),
+    ) -> dict:
+        """Re-arm every permanently-failed job.
+
+        The drain-the-backlog button: run it after fixing whatever broke
+        captures server-side and the queue replays everything that died while
+        it was broken. `limit` re-arms only the newest N."""
+        store = _job_store()
+        n = store.retry_all_failed(limit=limit)
+        log.info("capture-jobs: re-armed %d failed job(s)", n)
+        return {"requeued": n, "queue_depth": store.queue_depth()}
 
     @app.post(
         "/capture/html",
@@ -529,14 +703,27 @@ def create_app(*, docs_visible: bool | None = None) -> FastAPI:
         try:
             content = _dispatch(req.url, html=req.html, fallback_title=req.title)
         except Exception as e:
-            raise HTTPException(status_code=422, detail=str(e))
+            job_id = _enroll_failed_capture(
+                req.url, e, persist=req.persist, frontmatter=req.frontmatter,
+                html=req.html, fallback_title=req.title,
+            )
+            raise HTTPException(status_code=422, detail=_with_job_hint(str(e), job_id))
 
         doc_id = doc_path = body_hash = None
         if req.persist:
             try:
                 doc_id, doc_path, body_hash = _persist_capture(content, req.frontmatter)
             except Exception as e:
-                raise HTTPException(status_code=500, detail=f"capture extracted but persist failed: {e}")
+                job_id = _enroll_failed_capture(
+                    req.url, e, persist=req.persist, frontmatter=req.frontmatter,
+                    html=req.html, fallback_title=req.title,
+                )
+                raise HTTPException(
+                    status_code=500,
+                    detail=_with_job_hint(
+                        f"capture extracted but persist failed: {e}", job_id,
+                    ),
+                )
 
         return CaptureResponse(
             title=content.title,

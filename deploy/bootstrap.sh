@@ -193,6 +193,12 @@ if [ ! -d "$VENV_DIR" ]; then
 fi
 "${VENV_DIR}/bin/pip" install --quiet --upgrade pip
 "${VENV_DIR}/bin/pip" install --quiet -e "$CORE_REPO"
+# Playwright only drives the Chromium build that matches its own version,
+# and pip upgrades playwright without fetching it. Without this step every
+# LinkedIn capture fails with 422. Runs as the service user so the browser
+# lands in its own cache (~/.cache/ms-playwright), where the server looks.
+runuser -u "$SERVICE_USER" -- env HOME=/var/lib/amperstand \
+    "${VENV_DIR}/bin/playwright" install chromium
 "${VENV_DIR}/bin/pip" install --quiet -e "$CLI_REPO"
 
 echo "==> Setting ownership on ${REPO_ROOT}"

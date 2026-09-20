@@ -26,6 +26,7 @@ The server reads its configuration from environment variables (typically via `/e
 | --- | --- | --- |
 | `AMPERSTAND_CAPTURE_WORKERS` | `1` | Concurrent async-capture workers |
 | `AMPERSTAND_CAPTURE_JOB_TIMEOUT_S` | `120` | Per-job extraction timeout |
+| `AMPERSTAND_CAPTURE_MAX_ATTEMPTS` | `3` | Attempts per capture before the job is `failed`; retries back off from 1 min to 1 h |
 | `AMPERSTAND_CHAT_MODEL` | `gpt-4o-mini` | Model used by the chat API (`POST /chat`) |
 | `AMPERSTAND_RERANK_MODEL` | `gpt-4o-mini` | Model used by hybrid-search rerank |
 | `AMPERSTAND_RERANK_ENABLED` | `1` | Set to `0`/`false`/`no` to disable rerank globally |

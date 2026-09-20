@@ -3,7 +3,7 @@ title: Jobs
 description: "Inspect async capture status."
 ---
 
-When you POST to `/capture/async` or `/capture/html/async` you get a `job_id`. These endpoints let you look it up.
+When you POST to `/capture/async` or `/capture/html/async` you get a `job_id`. A synchronous `/capture` or `/capture/html` that fails is enrolled here too: its `422` `detail` ends with `(queued for retry as job <id>)`. These endpoints let you look a job up and re-arm one that gave up.
 
 ## GET /jobs/{job_id}
 
@@ -32,10 +32,10 @@ curl -H "Authorization: Bearer $AMPERSTAND_API_KEY" \
 
 | Status | Means |
 | --- | --- |
-| `queued` | Job is in the queue, no worker has claimed it yet |
+| `queued` | Waiting for a worker, or waiting out the backoff before its next attempt |
 | `running` | A worker is currently extracting |
 | `done` | Successfully captured; `doc_id` populated |
-| `failed` | Extractor or persist step failed; see `error` |
+| `failed` | Every attempt failed, or the error was permanent; see `error` |
 
 ### Errors
 
@@ -65,16 +65,58 @@ curl -H "Authorization: Bearer $AMPERSTAND_API_KEY" \
     { "id": "01JK...", "url": "...", "status": "done", ... },
     ...
   ],
-  "queue_depth": 3
+  "queue_depth": 3,
+  "counts": { "queued": 3, "running": 0, "done": 36, "failed": 5 }
 }
 ```
 
-`queue_depth` is the count of `queued` + `running` jobs at request time — useful for the extension's "recent clips" view.
+`queue_depth` is the count of `queued` + `running` jobs at request time — useful for the extension's "recent clips" view. `counts` is the per-status total across the whole table, the quickest way to spot a retry backlog.
+
+## POST /jobs/{job_id}/retry
+
+Re-arm one `failed` job with a fresh attempt budget. Use it when you know why the job failed and the cause is fixed.
+
+```bash
+curl -X POST -H "Authorization: Bearer $AMPERSTAND_API_KEY" \
+     http://localhost:8765/jobs/01JK.../retry
+```
+
+### Response
+
+```json
+{ "job_id": "01JK...", "status": "queued", "url": "https://danluu.com/..." }
+```
+
+### Errors
+
+- **404** — job_id doesn't exist
+- **409** — job is not `failed`; only failed jobs can be re-armed
+
+## POST /jobs/retry-failed
+
+Re-arm every `failed` job. Run it after fixing whatever broke captures server-side; the queue replays everything that died meanwhile.
+
+```bash
+curl -X POST -H "Authorization: Bearer $AMPERSTAND_API_KEY" \
+     "http://localhost:8765/jobs/retry-failed?limit=100"
+```
+
+### Query parameters
+
+| Param | Type | Default | What |
+| --- | --- | --- | --- |
+| `limit` | int 1–1000 | (all) | Re-arm only the newest N failed jobs |
+
+### Response
+
+```json
+{ "requeued": 5, "queue_depth": 5 }
+```
 
 ## Worker behavior
 
 - Single worker per server process; `claim_next` is atomic via a write lock + status guard
 - Per-job timeout: 120s default (configurable). Hitting it marks the job `failed` with `error: "timeout"`.
-- Retries: none. Failed jobs stay in the queue with their error message until you delete or retry them by hand.
+- Retries: a failed attempt is requeued with exponential backoff, 1 min doubling to a 1 h cap, until the job has used `AMPERSTAND_CAPTURE_MAX_ATTEMPTS` attempts (default 3); then it is `failed`. An extractor error marked permanent (for example a post that no longer exists) fails on the first attempt.
 
 The job rows are never auto-deleted — they're a useful audit log. If the table gets large, `amperstand-admin jobs prune --older-than 30d`.

@@ -128,7 +128,7 @@ Or pipe to a remote box via SSH:
 | Restart server | `sudo systemctl restart amperstand-server` |
 | Tail logs | `sudo journalctl -u amperstand-server -f` |
 | Rotate key | `sudo -u amperstand /opt/amperstand/venv/bin/amperstand-admin rotate-key --env-file /etc/amperstand/env`, then `sudo systemctl restart amperstand-server` |
-| Pull new code | `cd /opt/amperstand && sudo -u amperstand git pull && sudo -u amperstand /opt/amperstand/venv/bin/pip install -e ./amperstand-core && sudo systemctl restart amperstand-server` |
+| Pull new code | `cd /opt/amperstand && sudo -u amperstand git pull && sudo -u amperstand /opt/amperstand/venv/bin/pip install -e ./amperstand-core && sudo -u amperstand -H /opt/amperstand/venv/bin/playwright install chromium && sudo systemctl restart amperstand-server`. The `playwright install` keeps Chromium matched to the playwright release pip installed; skipping it fails every LinkedIn capture with 422. |
 | Re-enable Swagger temporarily | `sudo $EDITOR /etc/amperstand/env` → add `AMPERSTAND_PUBLIC_DOCS=1` → `sudo systemctl restart amperstand-server`. Remove when done. |
 
 ## What's NOT in this deploy
