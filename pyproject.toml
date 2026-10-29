@@ -39,6 +39,10 @@ dependencies = [
 
 [project.optional-dependencies]
 linkedin = ["faster-whisper>=1.0"]
+# In-process embeddings / cross-encoder rerank (AMPERSTAND_EMBED_PROVIDER=onnx,
+# AMPERSTAND_RERANK_PROVIDER=onnx). Imported lazily; the base install never
+# pulls onnxruntime.
+onnx = ["onnxruntime>=1.17", "tokenizers>=0.15", "numpy>=1.26"]
 dev = [
     "pytest>=8.0",
     "pytest-httpx>=0.30",
