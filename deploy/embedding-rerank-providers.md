@@ -402,8 +402,8 @@ degraded-quality signals and label their results accordingly.
    unpredictable.
 2. Pull the branch and install the extra:
    ```bash
-   cd /opt/amperstand && sudo -u amperstand git fetch && sudo -u amperstand git checkout feat/pluggable-embed-rerank
-   sudo -u amperstand /opt/amperstand/venv/bin/pip install -e './amperstand-core[onnx]'
+   cd /opt/amperstand/amperstand-core && sudo -u amperstand git fetch && sudo -u amperstand git checkout feat/pluggable-embed-rerank
+   sudo -u amperstand /opt/amperstand/venv/bin/pip install -e '/opt/amperstand/amperstand-core[onnx]'
    ```
    (`onnxruntime` wheel ~15 MB for x86_64 Linux, `tokenizers` ~3 MB, `numpy` ~17 MB.)
 3. Put the model files where the hardened unit can read them
@@ -478,8 +478,8 @@ OpenAI setup nothing changes except that the branch must be deployed for
 the new error behaviour:
 
 ```bash
-cd /opt/amperstand && sudo -u amperstand git fetch && sudo -u amperstand git checkout feat/pluggable-embed-rerank
-sudo -u amperstand /opt/amperstand/venv/bin/pip install -e ./amperstand-core
+cd /opt/amperstand/amperstand-core && sudo -u amperstand git fetch && sudo -u amperstand git checkout feat/pluggable-embed-rerank
+sudo -u amperstand /opt/amperstand/venv/bin/pip install -e /opt/amperstand/amperstand-core
 sudo systemctl restart amperstand-server
 ```
 
