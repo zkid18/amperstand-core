@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 DEFAULT_ENV_FILE = Path("/etc/amperstand/env")
@@ -17,6 +17,11 @@ class AdminConfig:
     env_file: Path | None
     env_file_exists: bool
     openai_api_key: str | None = None
+    # Merged view of the env-file and the process environment (process
+    # wins), so provider settings (AMPERSTAND_EMBED_*, AMPERSTAND_RERANK_*,
+    # vendor keys) reach the embedding factory the same way they reach the
+    # server through systemd's EnvironmentFile=.
+    env: dict[str, str] = field(default_factory=dict)
 
 
 def load_env_file(path: Path) -> dict[str, str]:
@@ -42,6 +47,7 @@ def resolve_config(env_file: Path | None = None) -> AdminConfig:
     """Resolve config preferring process env, then env-file, then defaults."""
     env_path = env_file
     file_env = load_env_file(env_path) if env_path else {}
+    merged = {**file_env, **{k: v for k, v in os.environ.items()}}
 
     raw_dir = os.environ.get("AMPERSTAND_DATA_DIR") or file_env.get("AMPERSTAND_DATA_DIR")
     data_dir = Path(raw_dir).expanduser() if raw_dir else DEFAULT_DATA_DIR
@@ -57,4 +63,5 @@ def resolve_config(env_file: Path | None = None) -> AdminConfig:
         env_file=env_path,
         env_file_exists=bool(env_path and env_path.exists()),
         openai_api_key=openai_key,
+        env=merged,
     )

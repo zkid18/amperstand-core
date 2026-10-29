@@ -8,14 +8,16 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse, PlainTextResponse
 
+from amperstand_core.embeddings import EmbeddingError
 from amperstand_core.search import (
+    BaseReranker,
+    IndexSignatureMismatch,
+    RerankError,
     SearchError,
     SearchIndexer,
     SearchResult,
     VectorIndexer,
     parse_sections,
-    rerank_enabled,
-    rerank_with_llm,
 )
 from amperstand_core.classifier_feedback import record_delete_as_skip
 from amperstand_core.store import (
@@ -35,6 +37,7 @@ from amperstand_core.server.vault_api.schemas import (
     HybridSearchRequest,
     ListResponse,
     SearchHit,
+    SearchMeta,
     SearchRequest,
     SearchResponse,
     SemanticSearchRequest,
@@ -42,8 +45,10 @@ from amperstand_core.server.vault_api.schemas import (
 )
 from amperstand_core.server.vault_api.store_factory import (
     get_indexer,
+    get_reranker,
     get_store,
     get_vec_indexer,
+    get_vec_unavailable_reason,
 )
 
 router = APIRouter(
@@ -89,6 +94,66 @@ def _indexer_dep() -> SearchIndexer:
 
 def _vec_indexer_dep() -> VectorIndexer | None:
     return get_vec_indexer()
+
+
+def _reranker_dep() -> BaseReranker:
+    return get_reranker()
+
+
+# ── provider failure → explicit 503s ───────────────────────────────
+#
+# Before providers were pluggable an embedding failure escaped as a bare
+# 500 (the 2026-10-24 outage: OpenAI balance at zero → 14s of retries →
+# "Internal Server Error" with the cause only in the journal). Every
+# provider problem now maps to a 503 whose detail names the provider and
+# the cause, and hybrid search degrades to BM25 only when the caller asks.
+
+
+def _embedding_unavailable(exc: EmbeddingError, vec: VectorIndexer) -> HTTPException:
+    sig = vec.embedder.signature
+    return HTTPException(
+        status_code=503,
+        detail={
+            "error": "embedding_provider_unavailable",
+            "provider": sig.provider,
+            "model": sig.model,
+            "detail": str(exc),
+        },
+    )
+
+
+def _index_mismatch(exc: IndexSignatureMismatch) -> HTTPException:
+    return HTTPException(
+        status_code=503,
+        detail={
+            "error": "vec_index_model_mismatch",
+            "index": exc.stored.as_dict(),
+            "configured": exc.configured.as_dict(),
+            "detail": str(exc),
+        },
+    )
+
+
+def _embed_query(vec: VectorIndexer, q: str) -> list[float]:
+    """Embed a query with the configured provider, or raise a 503 that says
+    exactly what is wrong (provider down / index built by another model)."""
+    try:
+        vec.index.check_signature()
+        return vec.embedder.embed(q)
+    except IndexSignatureMismatch as exc:
+        raise _index_mismatch(exc)
+    except EmbeddingError as exc:
+        raise _embedding_unavailable(exc, vec)
+
+
+def _vec_meta(vec: VectorIndexer | None, mode: str, **kw) -> SearchMeta:
+    sig = vec.embedder.signature if vec is not None else None
+    return SearchMeta(
+        mode=mode,
+        embed_provider=sig.provider if sig else None,
+        embed_model=sig.model if sig else None,
+        **kw,
+    )
 
 
 def _make_body_lookup(store: MarkdownStore):
@@ -250,39 +315,33 @@ def search(
     vec: Annotated[VectorIndexer | None, Depends(_vec_indexer_dep)],
 ) -> SearchResponse:
     mode = payload.mode
+    meta: SearchMeta | None = None
     try:
         if mode in ("any", "fts", "substring"):
             results = indexer.index.search(
                 payload.q, limit=payload.limit, mode=mode
             )
         elif mode == "semantic":
-            if vec is None:
-                raise HTTPException(
-                    status_code=503,
-                    detail={
-                        "error": "feature_requires_openai_key",
-                        "feature": "semantic_search",
-                        "detail": (
-                            "Semantic search is disabled. Set OPENAI_API_KEY on "
-                            "the server and run `amperstand-admin vec-rebuild` "
-                            "to populate the vector index."
-                        ),
-                    },
-                )
-            qvec = vec._embedder.embed(payload.q)
-            results = vec.index.search(qvec, limit=payload.limit)
+            v = _require_vec(vec, feature="semantic_search")
+            qvec = _embed_query(v, payload.q)
+            results = v.index.search(qvec, limit=payload.limit)
         elif mode == "hybrid":
             if vec is None:
-                # Graceful degradation: hybrid silently falls back to FTS
-                # rather than 503-ing. Logged elsewhere.
+                # Legacy endpoint: hybrid degrades to FTS rather than 503-ing,
+                # but says so in meta (fallback="bm25"). The dedicated
+                # /search/hybrid endpoint requires an explicit opt-in.
                 results = indexer.index.search(
                     payload.q, limit=payload.limit, mode="any"
+                )
+                meta = _vec_meta(
+                    None, "hybrid", fallback="bm25",
+                    warnings=[f"vector index unavailable: {get_vec_unavailable_reason()}"],
                 )
             else:
                 fts_hits = indexer.index.search(
                     payload.q, limit=max(payload.limit * 3, 30), mode="any"
                 )
-                qvec = vec._embedder.embed(payload.q)
+                qvec = _embed_query(vec, payload.q)
                 vec_hits = vec.index.search(
                     qvec, limit=max(payload.limit * 3, 30)
                 )
@@ -306,21 +365,32 @@ def search(
                 score=r.score,
             )
             for r in results
-        ]
+        ],
+        meta=meta or _vec_meta(vec if mode in ("semantic", "hybrid") else None, mode),
     )
 
 
-def _require_vec(vec: VectorIndexer | None) -> VectorIndexer:
+def _require_vec(vec: VectorIndexer | None, feature: str = "semantic_search") -> VectorIndexer:
     if vec is None:
+        reason = get_vec_unavailable_reason() or "no embedding provider configured"
+        # Keep the historical error code for the historical cause (no
+        # OpenAI key with the default provider); everything else is a
+        # generic "not available" with the actual reason attached.
+        needs_key = "OPENAI_API_KEY" in reason
         raise HTTPException(
             status_code=503,
             detail={
-                "error": "feature_requires_openai_key",
-                "feature": "semantic_search",
+                "error": "feature_requires_openai_key" if needs_key else "vector_index_unavailable",
+                "feature": feature,
+                "reason": reason,
                 "detail": (
                     "Semantic search is disabled. Set OPENAI_API_KEY on the "
                     "server and run `amperstand-admin vec-rebuild` to populate "
                     "the vector index."
+                    if needs_key else
+                    f"Semantic search is disabled: {reason}. Configure "
+                    "AMPERSTAND_EMBED_* on the server and run "
+                    "`amperstand-admin vec-rebuild` to populate the vector index."
                 ),
             },
         )
@@ -348,8 +418,11 @@ def search_semantic(
     """Embed the query, run KNN over section vectors. Pure semantic — no
     keyword fallback. Returns 503 when the vector index isn't available."""
     v = _require_vec(vec)
-    qvec = v._embedder.embed(payload.q)
-    return SearchResponse(results=_to_hits(v.index.search(qvec, limit=payload.limit)))
+    qvec = _embed_query(v, payload.q)
+    return SearchResponse(
+        results=_to_hits(v.index.search(qvec, limit=payload.limit)),
+        meta=_vec_meta(v, "semantic"),
+    )
 
 
 @router.post("/search/hybrid", response_model=SearchResponse)
@@ -358,59 +431,99 @@ def search_hybrid(
     store: Annotated[MarkdownStore, Depends(_store_dep)],
     indexer: Annotated[SearchIndexer, Depends(_indexer_dep)],
     vec: Annotated[VectorIndexer | None, Depends(_vec_indexer_dep)],
+    reranker: Annotated[BaseReranker, Depends(_reranker_dep)],
 ) -> SearchResponse:
-    """Reciprocal rank fusion of FTS BM25 + vector KNN, with optional LLM
+    """Reciprocal rank fusion of FTS BM25 + vector KNN, with optional
     re-rank as a final precision stage.
 
-    Returns 503 when the vector index isn't available (no OPENAI_API_KEY,
-    or the index hasn't been populated) — clients that want a BM25 fallback
-    should explicitly call POST /vault/search with mode="any". Silent
-    fallback was found to deceive callers about which retrieval mode they
-    were actually getting.
+    Returns 503 when the vector index isn't available (no embedding
+    provider configured, the index hasn't been populated, the provider is
+    down, or the index was built by a different model) — clients that
+    want a BM25 fallback must say so with `allow_bm25_fallback=true`, and
+    then get `meta.fallback="bm25"` in the response. Silent fallback was
+    found to deceive callers about which retrieval mode they were
+    actually getting.
 
     When `rerank=True` the candidate pool is widened to ~4× `limit`, fused,
-    then graded by gpt-4o-mini and re-sorted by relevance. If rerank was
-    requested but isn't available (no OpenAI key), responds 503 rather than
-    silently dropping the rerank stage.
+    then re-scored by the configured reranker (LLM grader, a cross-encoder
+    sidecar, or a vendor rerank API) and re-sorted by relevance. If rerank
+    was requested but isn't available, responds 503 rather than silently
+    dropping the rerank stage. If the reranker fails mid-request the
+    fused order is returned with `meta.rerank_applied=false` (or a 503
+    when AMPERSTAND_RERANK_FAIL_MODE=hard).
     """
-    v = _require_vec(vec)
-    if bool(payload.rerank) and not rerank_enabled():
+    use_rerank = bool(payload.rerank)
+    if use_rerank and not reranker.available:
+        reason = reranker.unavailable_reason() or "rerank is not available"
         raise HTTPException(
             status_code=503,
             detail={
-                "error": "feature_requires_openai_key",
+                "error": "feature_requires_openai_key" if "OPENAI_API_KEY" in reason
+                         else "rerank_unavailable",
                 "feature": "hybrid_search_rerank",
                 "detail": (
-                    "Rerank was requested but is disabled. Set OPENAI_API_KEY "
-                    "on the server to enable. Or set rerank=false in the "
-                    "request body to get BM25+vector results without rerank."
+                    f"{reason} Or set rerank=false in the request body to get "
+                    "BM25+vector results without rerank."
                 ),
             },
         )
-    use_rerank = bool(payload.rerank)
-    # When rerank is on, fetch a fatter candidate pool so the LLM has more
-    # options to reorder. ~4× limit (capped to 60) is a reasonable trade
-    # between coverage and prompt size.
+    # When rerank is on, fetch a fatter candidate pool so the reranker has
+    # more options to reorder. ~4× limit (capped to 60) is a reasonable
+    # trade between coverage and prompt size.
     pool_size = (
         max(payload.limit * 4, 30) if use_rerank else max(payload.limit * 3, 30)
     )
     pool_size = min(pool_size, 60)
 
     fts_hits = indexer.index.search(payload.q, limit=pool_size, mode="any")
-    qvec = vec._embedder.embed(payload.q)
-    vec_hits = vec.index.search(qvec, limit=pool_size)
+
+    # Vector side — or the explicit BM25 fallback.
+    try:
+        v = _require_vec(vec, feature="hybrid_search")
+        qvec = _embed_query(v, payload.q)
+    except HTTPException as exc:
+        if not payload.allow_bm25_fallback or exc.status_code != 503:
+            raise
+        detail = exc.detail if isinstance(exc.detail, dict) else {"detail": str(exc.detail)}
+        return SearchResponse(
+            results=_to_hits(fts_hits[: payload.limit]),
+            meta=_vec_meta(
+                vec, "hybrid",
+                rerank_requested=use_rerank, rerank_applied=False,
+                rerank_kind=reranker.kind,
+                fallback="bm25",
+                warnings=[f"{detail.get('error')}: {detail.get('detail')}"],
+            ),
+        )
+    vec_hits = v.index.search(qvec, limit=pool_size)
     fused = _rrf_fuse(fts_hits, vec_hits, limit=pool_size)
 
+    meta = _vec_meta(v, "hybrid", rerank_requested=use_rerank, rerank_kind=reranker.kind)
     if use_rerank:
-        results = rerank_with_llm(
-            payload.q,
-            fused,
-            body_lookup=_make_body_lookup(store),
-            limit=payload.limit,
-        )
+        try:
+            outcome = reranker.rerank(
+                payload.q,
+                fused,
+                body_lookup=_make_body_lookup(store),
+                limit=payload.limit,
+            )
+        except RerankError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "error": "rerank_provider_unavailable",
+                    "kind": reranker.kind,
+                    "provider": reranker.provider,
+                    "detail": str(exc),
+                },
+            )
+        results = outcome.results
+        meta.rerank_applied = outcome.applied
+        if outcome.error:
+            meta.warnings.append(f"rerank not applied: {outcome.error}")
     else:
         results = fused[:payload.limit]
-    return SearchResponse(results=_to_hits(results))
+    return SearchResponse(results=_to_hits(results), meta=meta)
 
 
 @router.get("/{doc_id}/related", response_model=SearchResponse)

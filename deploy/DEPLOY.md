@@ -131,6 +131,28 @@ Or pipe to a remote box via SSH:
 | Pull new code | `cd /opt/amperstand && sudo -u amperstand git pull && sudo -u amperstand /opt/amperstand/venv/bin/pip install -e ./amperstand-core && sudo -u amperstand -H /opt/amperstand/venv/bin/playwright install chromium && sudo systemctl restart amperstand-server`. The `playwright install` keeps Chromium matched to the playwright release pip installed; skipping it fails every LinkedIn capture with 422. |
 | Re-enable Swagger temporarily | `sudo $EDITOR /etc/amperstand/env` → add `AMPERSTAND_PUBLIC_DOCS=1` → `sudo systemctl restart amperstand-server`. Remove when done. |
 
+## Embedding and rerank providers
+
+Semantic search needs an embedding provider and, optionally, a reranker.
+With nothing configured the server uses OpenAI (`OPENAI_API_KEY`) for both,
+as before. To bring your own vendor (Voyage, Jina, Cohere, any
+OpenAI-compatible host) or to run open models nearby (a TEI/Infinity
+sidecar, a separate box, or in-process ONNX via `pip install -e
+'./amperstand-core[onnx]'`), set the `AMPERSTAND_EMBED_*` /
+`AMPERSTAND_RERANK_*` variables in `/etc/amperstand/env`. The full
+reference, worked configurations, the index-migration procedure and the
+per-mode deploy steps are in `deploy/embedding-rerank-providers.md`.
+
+Two rules worth knowing before touching the env file:
+
+- the vector index records the provider/model/dim it was built with;
+  changing the model without `amperstand-admin vec-rebuild --force` makes
+  semantic/hybrid search answer `503 vec_index_model_mismatch` (nothing is
+  deleted) until the rebuild runs;
+- a provider outage answers `503 embedding_provider_unavailable` with the
+  cause; hybrid callers that can live with keyword-only results must pass
+  `allow_bm25_fallback=true` and will see `meta.fallback="bm25"`.
+
 ## What's NOT in this deploy
 
 - **Per-user identity.** Single shared API key. Multi-tenant requires app-level changes.

@@ -183,3 +183,82 @@ def test_integrity_detects_missing_index(runner: CliRunner, vault: Path) -> None
     r = runner.invoke(app, ["integrity"])
     assert r.exit_code == 1, r.stdout
     assert "missing index entries" in r.stdout
+
+
+# ── vec-rebuild with pluggable providers ─────────────────────────────
+
+
+def _fake_provider_env(monkeypatch: pytest.MonkeyPatch, model: str = "fake-model"):
+    from amperstand_core.server.admin_cli.commands import vec_rebuild as vec_rebuild_cmd
+    from tests.fakes import FakeEmbedder
+
+    emb = FakeEmbedder(model=model, dim=8)
+    monkeypatch.setenv("AMPERSTAND_EMBED_PROVIDER", "openai_compatible")
+    monkeypatch.setenv("AMPERSTAND_EMBED_BASE_URL", "http://fake.invalid")
+    monkeypatch.setenv("AMPERSTAND_EMBED_MODEL", model)
+    monkeypatch.setenv("AMPERSTAND_EMBED_DIM", "8")
+    monkeypatch.setattr(vec_rebuild_cmd, "build_embedder", lambda cfg, **kw: emb)
+    return emb
+
+
+def _needs_vec():
+    from tests.fakes import sqlite_vec_loadable
+    if not sqlite_vec_loadable():
+        pytest.skip("sqlite-vec not loadable here")
+
+
+def test_vec_rebuild_refuses_without_openai_key_by_default(
+    runner: CliRunner, vault: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("AMPERSTAND_EMBED_PROVIDER", raising=False)
+    r = runner.invoke(app, ["vec-rebuild", "--env-file", str(vault.parent / "missing.env")])
+    assert r.exit_code != 0
+    assert "OPENAI_API_KEY" in r.stdout + str(r.exception)
+
+
+def test_vec_rebuild_any_provider_and_signature_guard(
+    runner: CliRunner, vault: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _needs_vec()
+    from amperstand_core.embeddings import EmbedSignature
+    from amperstand_core.search import VectorIndex
+
+    env_file = str(vault.parent / "missing.env")
+    emb = _fake_provider_env(monkeypatch)
+
+    r = runner.invoke(app, ["vec-rebuild", "--env-file", env_file, "--dry-run"])
+    assert r.exit_code == 0, r.stdout
+    assert "provider=fake" in r.stdout and "would scan 2 docs" in r.stdout
+    assert not emb.calls
+
+    r = runner.invoke(app, ["vec-rebuild", "--env-file", env_file])
+    assert r.exit_code == 0, r.stdout
+    assert "indexed=2" in r.stdout and emb.calls
+    # 2 docs x (preamble + heading section) = 4 section vectors.
+    idx = VectorIndex(vault / ".store" / "vec.db", signature=EmbedSignature("fake", "fake-model", 8))
+    assert idx.count() == 4 and idx.stored_signature() == EmbedSignature("fake", "fake-model", 8)
+    idx.close()
+
+    # Incremental: nothing changed → nothing re-embedded.
+    emb.calls.clear()
+    r = runner.invoke(app, ["vec-rebuild", "--env-file", env_file])
+    assert r.exit_code == 0 and "skipped_unchanged=2" in r.stdout and not emb.calls
+
+    # Switch model without --force → refused, index untouched.
+    emb2 = _fake_provider_env(monkeypatch, model="other-model")
+    r = runner.invoke(app, ["vec-rebuild", "--env-file", env_file])
+    assert r.exit_code != 0
+    assert "refusing to mix vector spaces" in (r.stdout + str(r.exception))
+    assert not emb2.calls
+    idx = VectorIndex(vault / ".store" / "vec.db", signature=EmbedSignature("fake", "fake-model", 8))
+    assert idx.count() == 4
+    idx.close()
+
+    # --force → reset + re-embed under the new signature.
+    r = runner.invoke(app, ["vec-rebuild", "--env-file", env_file, "--force"])
+    assert r.exit_code == 0, r.stdout
+    assert "indexed=2" in r.stdout and emb2.calls
+    idx = VectorIndex(vault / ".store" / "vec.db", signature=EmbedSignature("fake", "other-model", 8))
+    assert idx.count() == 4 and idx.mismatch is None
+    idx.close()
