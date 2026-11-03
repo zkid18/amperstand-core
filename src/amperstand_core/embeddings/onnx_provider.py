@@ -78,6 +78,11 @@ class ONNXEmbedder(BaseEmbedder):
         so.intra_op_num_threads = max(1, threads)
         so.inter_op_num_threads = 1
         so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        # Every batch has a different sequence length. The default CPU arena and
+        # memory-pattern cache keep each shape's peak and never return it, which
+        # took a 1 GB server to 2.3 GB on a 2 GB droplet. Allocate per run instead.
+        so.enable_cpu_mem_arena = False
+        so.enable_mem_pattern = False
         self._sess = ort.InferenceSession(str(graph_path), so, providers=["CPUExecutionProvider"])
         self._input_names = {i.name for i in self._sess.get_inputs()}
         self._output_name = self._sess.get_outputs()[0].name

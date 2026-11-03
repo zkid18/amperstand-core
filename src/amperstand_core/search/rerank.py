@@ -416,6 +416,11 @@ class ONNXCrossEncoderReranker(BaseReranker):
         so = ort.SessionOptions()
         so.intra_op_num_threads = max(1, threads)
         so.inter_op_num_threads = 1
+        # Every batch has a different sequence length. The default CPU arena and
+        # memory-pattern cache keep each shape's peak and never return it, which
+        # took a 1 GB server to 2.3 GB on a 2 GB droplet. Allocate per run instead.
+        so.enable_cpu_mem_arena = False
+        so.enable_mem_pattern = False
         self._sess = ort.InferenceSession(str(d / onnx_file), so, providers=["CPUExecutionProvider"])
         self._inputs = {i.name for i in self._sess.get_inputs()}
 
