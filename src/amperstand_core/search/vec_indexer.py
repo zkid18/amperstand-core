@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import logging
 
-from amperstand_core.embeddings import Embedder, EmbeddingError
+from amperstand_core.embeddings import BaseEmbedder, EmbeddingError
 from amperstand_core.search.parser import parse_sections
 from amperstand_core.search.vec_index import (
     VectorIndex,
@@ -31,7 +31,7 @@ class VectorIndexer:
         self,
         store: MarkdownStore,
         index: VectorIndex,
-        embedder: Embedder,
+        embedder: BaseEmbedder,
     ) -> None:
         self._store = store
         self._index = index
@@ -44,6 +44,10 @@ class VectorIndexer:
     @property
     def index(self) -> VectorIndex:
         return self._index
+
+    @property
+    def embedder(self) -> BaseEmbedder:
+        return self._embedder
 
     def handle_change(self, event: ChangeEvent) -> None:
         try:

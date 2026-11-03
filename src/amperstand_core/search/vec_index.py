@@ -8,6 +8,13 @@ touching the FTS5 index next door.
 
 Each row in the index represents one section of a doc. Reindexing a doc
 deletes all rows whose doc_id matches and re-inserts new ones.
+
+Model safety: vectors are only comparable within one embedding space, so
+the index records the `EmbedSignature` (provider/model/dim) it was built
+with in `vec_meta_kv`. Opening it with a different configured signature
+does not destroy anything — reads and writes raise `IndexSignatureMismatch`
+(→ HTTP 503) until the operator runs `amperstand-admin vec-rebuild --force`
+or restores the matching configuration.
 """
 
 from __future__ import annotations
@@ -19,13 +26,30 @@ import struct
 from pathlib import Path
 from typing import Sequence
 
-from amperstand_core.embeddings import EMBED_DIM
+from amperstand_core.embeddings import EMBED_DIM, LEGACY_SIGNATURE, EmbedSignature
 from amperstand_core.search.errors import SearchError
 from amperstand_core.search.models import Section, SearchResult
 
 logger = logging.getLogger(__name__)
 
 SCHEMA_VERSION = 2  # bumped from 1: dim 1536 → 512 (Matryoshka)
+
+META_PROVIDER = "embed_provider"
+META_MODEL = "embed_model"
+META_DIM = "embed_dim"
+
+
+class IndexSignatureMismatch(SearchError):
+    """The on-disk index was built by a different embedding model/dim."""
+
+    def __init__(self, stored: EmbedSignature, configured: EmbedSignature) -> None:
+        self.stored = stored
+        self.configured = configured
+        super().__init__(
+            f"vector index was built with {stored} but the server is configured "
+            f"for {configured}; run `amperstand-admin vec-rebuild --force` to "
+            f"re-embed, or restore the matching AMPERSTAND_EMBED_* settings"
+        )
 
 
 def _sqlite_with_extensions():
@@ -76,11 +100,34 @@ def section_text_for_embedding(section: Section) -> str:
 
 
 class VectorIndex:
-    """sqlite-vec backed semantic index over heading-bounded sections."""
+    """sqlite-vec backed semantic index over heading-bounded sections.
 
-    def __init__(self, path: Path) -> None:
+    `signature` names the embedding space the caller will write/query
+    with. Omit it (legacy callers) and the index assumes the pre-signature
+    default, OpenAI text-embedding-3-small @512.
+    """
+
+    def __init__(
+        self,
+        path: Path,
+        *,
+        signature: EmbedSignature | None = None,
+        dim: int | None = None,
+    ) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        if signature is None:
+            signature = EmbedSignature(
+                provider=LEGACY_SIGNATURE.provider,
+                model=LEGACY_SIGNATURE.model,
+                dim=dim or EMBED_DIM,
+            )
+        elif dim is not None and dim != signature.dim:
+            raise SearchError(f"dim={dim} disagrees with signature {signature}")
+        self.signature = signature
+        self.dim = signature.dim
+        self.mismatch: IndexSignatureMismatch | None = None
+
         sqlite3 = _sqlite_with_extensions()
         try:
             import sqlite_vec
@@ -103,9 +150,35 @@ class VectorIndex:
                 "CREATE TABLE IF NOT EXISTS vec_meta_kv ("
                 "  key TEXT PRIMARY KEY, value TEXT NOT NULL)"
             )
+            row = self._conn.execute(
+                "SELECT value FROM vec_meta_kv WHERE key='schema_version'"
+            ).fetchone()
+            if row is not None and int(row[0]) != SCHEMA_VERSION:
+                self._drop_tables_locked()
+                row = None
+            if row is None:
+                self._conn.execute(
+                    "INSERT OR REPLACE INTO vec_meta_kv(key,value) VALUES('schema_version',?)",
+                    (str(SCHEMA_VERSION),),
+                )
+            stored = self._stored_signature_locked()
+            if self._count_locked() == 0 and stored != self.signature:
+                # Empty index (fresh, legacy-but-empty, or stamped by a model
+                # that never got to write anything): nothing to protect, so
+                # adopt the configured signature and recreate the vec0 table
+                # at the configured dim.
+                self._drop_vec_tables_locked()
+                self._stamp_locked(self.signature)
+                stored = self.signature
+            if stored is None:
+                # Populated index predating signatures — production's
+                # vec.db. It can only have come from the legacy model.
+                stored = LEGACY_SIGNATURE
+                if stored == self.signature:
+                    self._stamp_locked(stored)
             self._conn.execute(
                 f"CREATE VIRTUAL TABLE IF NOT EXISTS vec_sections USING vec0("
-                f"  embedding float[{EMBED_DIM}])"
+                f"  embedding float[{stored.dim}])"
             )
             self._conn.execute(
                 "CREATE TABLE IF NOT EXISTS vec_section_meta ("
@@ -123,16 +196,62 @@ class VectorIndex:
                 "CREATE INDEX IF NOT EXISTS idx_vec_section_meta_hash "
                 "ON vec_section_meta(content_hash)"
             )
-            row = self._conn.execute(
-                "SELECT value FROM vec_meta_kv WHERE key='schema_version'"
-            ).fetchone()
-            if row is None:
-                self._conn.execute(
-                    "INSERT INTO vec_meta_kv(key,value) VALUES('schema_version',?)",
-                    (str(SCHEMA_VERSION),),
-                )
-            elif int(row[0]) != SCHEMA_VERSION:
-                self.reset()
+        if stored != self.signature:
+            self.mismatch = IndexSignatureMismatch(stored, self.signature)
+            logger.error("%s", self.mismatch)
+        else:
+            self.mismatch = None
+
+    # ── signature bookkeeping ───────────────────────────────────────
+
+    def _stored_signature_locked(self) -> EmbedSignature | None:
+        rows = dict(
+            self._conn.execute(
+                "SELECT key, value FROM vec_meta_kv WHERE key IN (?,?,?)",
+                (META_PROVIDER, META_MODEL, META_DIM),
+            ).fetchall()
+        )
+        if META_MODEL not in rows or META_DIM not in rows:
+            return None
+        return EmbedSignature(
+            provider=rows.get(META_PROVIDER, "openai"),
+            model=rows[META_MODEL],
+            dim=int(rows[META_DIM]),
+        )
+
+    def _stamp_locked(self, sig: EmbedSignature) -> None:
+        self._conn.executemany(
+            "INSERT OR REPLACE INTO vec_meta_kv(key,value) VALUES(?,?)",
+            [(META_PROVIDER, sig.provider), (META_MODEL, sig.model), (META_DIM, str(sig.dim))],
+        )
+
+    def _count_locked(self) -> int:
+        has_meta = self._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='vec_section_meta'"
+        ).fetchone()
+        if not has_meta:
+            return 0
+        return self._conn.execute("SELECT COUNT(*) FROM vec_section_meta").fetchone()[0]
+
+    def _drop_vec_tables_locked(self) -> None:
+        self._conn.execute("DROP TABLE IF EXISTS vec_section_meta")
+        self._conn.execute("DROP TABLE IF EXISTS vec_sections")
+
+    def _drop_tables_locked(self) -> None:
+        self._drop_vec_tables_locked()
+        self._conn.execute("DROP TABLE IF EXISTS vec_meta_kv")
+        self._conn.execute(
+            "CREATE TABLE IF NOT EXISTS vec_meta_kv (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+        )
+
+    def stored_signature(self) -> EmbedSignature | None:
+        """What the on-disk index says it was built with (None = legacy, unstamped)."""
+        return self._stored_signature_locked()
+
+    def check_signature(self) -> None:
+        """Raise `IndexSignatureMismatch` if this index can't serve the configured model."""
+        if self.mismatch is not None:
+            raise self.mismatch
 
     # ── writes ──────────────────────────────────────────────────────
 
@@ -159,6 +278,7 @@ class VectorIndex:
         `embeddings[i]` corresponds to `sections[i]`. Caller is responsible
         for skipping unchanged sections (see existing_section_hashes).
         """
+        self.check_signature()
         if len(sections) != len(embeddings):
             raise SearchError(
                 f"sections/embeddings length mismatch: "
@@ -167,9 +287,9 @@ class VectorIndex:
         with self._conn:
             self._delete_doc_locked(doc_id)
             for section, vec in zip(sections, embeddings):
-                if len(vec) != EMBED_DIM:
+                if len(vec) != self.dim:
                     raise SearchError(
-                        f"embedding has {len(vec)} dims, expected {EMBED_DIM}"
+                        f"embedding has {len(vec)} dims, expected {self.dim}"
                     )
                 cur = self._conn.execute(
                     "INSERT INTO vec_sections(embedding) VALUES (?)",
@@ -203,10 +323,10 @@ class VectorIndex:
         )
 
     def reset(self) -> None:
+        """Drop every vector and re-stamp the index with the configured
+        signature. This is how a model switch is made: reset, then re-embed."""
         with self._conn:
-            self._conn.execute("DROP TABLE IF EXISTS vec_section_meta")
-            self._conn.execute("DROP TABLE IF EXISTS vec_sections")
-            self._conn.execute("DROP TABLE IF EXISTS vec_meta_kv")
+            self._drop_tables_locked()
         self._init_schema()
 
     # ── reads ───────────────────────────────────────────────────────
@@ -236,8 +356,10 @@ class VectorIndex:
         ).fetchall()
         if not rows:
             return None
-        # Unpack each blob, sum, divide.
-        n = EMBED_DIM
+        # Unpack each blob, sum, divide. Use the *stored* dim: related-docs
+        # lookups work on stored vectors even when the configured model
+        # differs (no query embedding is involved).
+        n = len(rows[0][0]) // 4
         accum = [0.0] * n
         for (blob,) in rows:
             vec = struct.unpack(f"{n}f", blob)
@@ -254,9 +376,10 @@ class VectorIndex:
     def search(self, query_embedding: list[float], *, limit: int = 20) -> list[SearchResult]:
         if not 1 <= limit <= 1000:
             raise SearchError("limit out of range (1..1000)")
-        if len(query_embedding) != EMBED_DIM:
+        stored_dim = self.mismatch.stored.dim if self.mismatch else self.dim
+        if len(query_embedding) != stored_dim:
             raise SearchError(
-                f"query embedding has {len(query_embedding)} dims, expected {EMBED_DIM}"
+                f"query embedding has {len(query_embedding)} dims, expected {stored_dim}"
             )
         rows = self._conn.execute(
             "SELECT v.rowid, m.doc_id, m.section_title, m.section_path, v.distance "
@@ -282,6 +405,12 @@ class VectorIndex:
                 )
             )
         return results
+
+    def search_query(self, query_embedding: list[float], *, limit: int = 20) -> list[SearchResult]:
+        """`search()` for a *freshly embedded query*: refuses on a model
+        mismatch, because the query vector lives in the wrong space."""
+        self.check_signature()
+        return self.search(query_embedding, limit=limit)
 
     def close(self) -> None:
         self._conn.close()

@@ -90,8 +90,25 @@ class SearchHit(BaseModel):
     score: float
 
 
+class SearchMeta(BaseModel):
+    """How a search was actually answered — so a caller can tell a real
+    hybrid result from a BM25 fallback or an un-reranked list."""
+
+    mode: str
+    embed_provider: str | None = None
+    embed_model: str | None = None
+    rerank_requested: bool = False
+    rerank_applied: bool = False
+    rerank_kind: str | None = None
+    # "bm25" when vectors were unavailable and the caller opted in with
+    # allow_bm25_fallback — never set silently.
+    fallback: str | None = None
+    warnings: list[str] = Field(default_factory=list)
+
+
 class SearchResponse(BaseModel):
     results: list[SearchHit] = Field(default_factory=list)
+    meta: SearchMeta | None = None
 
 
 class SemanticSearchRequest(BaseModel):
@@ -114,5 +131,14 @@ class HybridSearchRequest(BaseModel):
             "pool, asks gpt-4o-mini to score relevance, returns top `limit` by "
             "LLM judgement. +1-2s latency, ~$0.001/query. Server-wide kill "
             "switch: AMPERSTAND_RERANK_ENABLED=0."
+        ),
+    )
+    allow_bm25_fallback: bool = Field(
+        default=False,
+        description=(
+            "Explicit opt-in: when the embedding provider is down (or no "
+            "vector index is configured) answer with BM25-only results and "
+            "meta.fallback='bm25' instead of a 503. Off by default so a "
+            "hybrid request never silently degrades."
         ),
     )
