@@ -1,8 +1,5 @@
 # Pluggable embedding and rerank providers
 
-Status: design + implementation on branch `feat/pluggable-embed-rerank`,
-2026-10-28. Nothing deployed.
-
 ## 1. Summary
 
 Today `/vault/search/semantic` and `/vault/search/hybrid` depend on one
@@ -40,7 +37,7 @@ fallback flagged in the response.
 
 **Recommendation** (details in §10): run **Nearby, in-process ONNX** on
 the droplet — granite-97m for embeddings and mmarco-mMiniLMv2 as the
-cross-encoder, together ~0.7–0.8 GB resident inside uvicorn (§5) —
+cross-encoder, with the server process at ~0.8 GB resident (§5) —
 and keep **BYOK OpenAI** as the documented alternative. This removes the
 vendor-balance dependency entirely for ~$0/month, at the price of one
 droplet resize to 2 GB (the current 961 MB box has ~300 MB free and is
@@ -287,17 +284,32 @@ available, 1 GB swap with ~510 MB used; uvicorn ~150 MB RSS plus
 
 | | (a) Sidecar on the droplet | (b) Separate box | (c) In-process ONNX |
 |---|---|---|---|
-| Extra resident memory on the droplet | TEI CPU build loads the fp32 weights (390 MB granite, 470 MB mmarco) plus the same tokenizers as below → ~0.6 GB + ~0.7 GB in two processes. Infinity (torch) more. | ~0 | measured on one M1 core: granite-97m ≈ **350–400 MB** after load — the 180k-token tokenizer alone is ~200 MB, the quint8 session ~100–130 MB — plus a transient **+200–300 MB** while embedding a 2048-token section (ORT arena; ~+50 MB at 512 tokens). mmarco ≈ **300–380 MB** after load (250k-token XLM-R tokenizer ~230 MB). Both in uvicorn: **~0.7–0.8 GB** on top of today's 150 MB. Model files 98 + 119 MB on disk. |
+| Extra resident memory on the droplet | TEI CPU build loads the fp32 weights (390 MB granite, 470 MB mmarco) plus the same tokenizers as below → ~0.6 GB + ~0.7 GB in two processes. Infinity (torch) more. | ~0 | measured on the droplet: a Python process goes from 72 MB to 450 MB after loading granite (483 MB after a 1024-token embed), 932 MB after also loading mmarco, 1,090 MB after a 40-passage rerank. Measured on one M1 core: granite-97m ≈ **350–400 MB** after load — the 180k-token tokenizer alone is ~200 MB, the quint8 session ~100–130 MB — plus a transient **+200–300 MB** while embedding a 2048-token section (ORT arena; ~+50 MB at 512 tokens). mmarco ≈ **300–380 MB** after load (250k-token XLM-R tokenizer ~230 MB). Both in uvicorn: **~0.7–0.8 GB** on top of the 150 MB base server. Model files 98 + 119 MB on disk. |
 | CPU contention | The sidecar and uvicorn share one vCPU; a 40-passage rerank or a long-section embed stalls API requests for its duration. | none on the droplet; one network hop (~1 ms on a VPC) | same vCPU, same process: embedding a long captured doc blocks that uvicorn worker (captures already run in a background worker thread, so API latency is affected only during the 0.2–3 s inference) |
-| Query latency (single M1 thread; expect 2–4× on the droplet's shared vCPU) | ≈ in-process + HTTP overhead | ≈ in-process + ~1 ms | query embed ~11 ms (32 tokens); document embed 0.23 s @512 tokens, 0.8 s @1024, 2.7 s @2048; cross-encoder pool 20 / 40: not yet measured (§9) |
-| Full re-embed of the vault (50k sections, ~30M tokens) | hours on the droplet; build on the Mac instead (§8) | hours on a 1 vCPU box; build on the Mac | same — build on the Mac |
+| Query latency (single M1 thread; expect 2–4× on the droplet's shared vCPU) | ≈ in-process + HTTP overhead | ≈ in-process + ~1 ms | M1, one thread: query embed ~11 ms (32 tokens); document embed 0.23 s @512 tokens, 0.8 s @1024, 2.7 s @2048. **Droplet, one shared vCPU:** query embed ~20 ms; document embed 2.9 s @1024 tokens; cross-encoder over 600-char passages **8.1 s for a pool of 20, 17.6 s for 40** (the pool for `limit=10, rerank=true`). |
+| Full re-embed of the vault (50,888 sections, 22M tokens at a 1024-token cap) | hours on the droplet | hours on a 1 vCPU box | measured on the droplet at `Nice=19`: ~315 tokens/s, **19.4 h**, peak 900 MB. Build on the server itself, or on a machine with the same CPU instruction set (§6): an int8 index built on an M1 does not match x86 query vectors. |
 | Ops burden | two systemd units + Docker (or the TEI binary), model cache dir, health checks; TEI's Rust binary has no Python deps | one more box to patch, a VPC + firewall, two units | none beyond `pip install '.[onnx]'` and copying two model directories |
 | Failure modes | sidecar OOM-killed → 503 `embedding_provider_unavailable` (explicit); both die together under memory pressure | box down / network partition → 503 (explicit); independent of the droplet's memory | model files missing → server starts with semantic search disabled and logs why; inference error → 503 |
 | Resize needed | yes: 4 GB for TEI ×2 (≈1.3 GB resident) next to uvicorn and the bots | droplet: none; new box: 2 GB / 1 vCPU for TEI with both models (1 GB fits only one of them), 2 GB for Infinity | **2 GB required** (961 MB today with ~300 MB free and 500 MB already in swap cannot take +0.7–0.8 GB); on 2 GB the total is ≈ uvicorn 0.9 GB + bots 0.3 GB, leaving ~0.6 GB headroom for the transient. Setting `AMPERSTAND_EMBED_ONNX_MAX_TOKENS=1024` halves the transient at the cost of truncating the ~5 % of sections longer than 1024 tokens. |
 | Vendor dependency | none | none | none |
 | Quality | identical model → identical vectors; TEI runs fp32 (slightly better than quint8) | same | quint8 (dynamic int8) — comparison against the OpenAI index pending (§9) |
 
-Cost: DigitalOcean 1 vCPU / 2 GB is $12/mo vs $6/mo today; a second
+**(c) in production, 1 vCPU / 2 GB droplet.** The server process holds
+770–825 MB with both models loaded and serving reranked searches, with no
+swap; the bots add ~0.15 GB. Hybrid search takes ~0.6 s without rerank
+and 18–32 s with it (`limit=10`, a 40-passage pool), most of it the
+cross-encoder. Parallel reranked requests share the one vCPU, so run
+sweeps with one worker.
+
+Both ONNX sessions disable onnxruntime's CPU memory arena and
+memory-pattern cache (`enable_cpu_mem_arena`, `enable_mem_pattern`).
+Every batch has a different sequence length; with those defaults on,
+each shape kept its peak allocation and 20 reranked searches took the
+server to 2.27 GB, 0.95 GB of it in swap. Scores are identical either
+way. Resident memory still rises slowly (768 → 824 MB over 20 searches);
+check it after long uptimes.
+
+Cost: DigitalOcean 1 vCPU / 2 GB is $12/mo vs $6/mo for 1 GB; a second
 1 vCPU / 1 GB box is +$6/mo. BYOK stays at ~$0.70 per full re-embed and
 ~$0.001 per reranked query.
 
@@ -334,30 +346,50 @@ Migration path for a model switch (any setup):
    live with BM25 meanwhile should pass `allow_bm25_fallback=true`.
 3. Build the new index — on the droplet with
    `sudo -u amperstand /opt/amperstand/venv/bin/amperstand-admin vec-rebuild --force`
-   (hours for Nearby on 1 vCPU; ~15 min for a hosted API), or on the Mac
-   (§8) and upload.
+   (about 19 h for Nearby on 1 vCPU at low priority; ~15 min for a hosted API), or into a
+   separate file on a machine with the server's CPU instruction set and
+   upload it (below).
 4. Restart the server. `journalctl` shows `vector search: <signature>
    (index <signature>)` on startup.
 
-### Building `vec.db` on the Mac and uploading it
+### Building `vec.db` on another machine and uploading it
 
 The index is a single SQLite file whose rows are keyed by `doc_id` and the
-section content hash, so an index built from a copy of `docs/` is
-byte-for-byte usable on the droplet, provided the vault did not change in
-between (and if it did, the incremental `vec-rebuild` on the droplet
-embeds only the changed docs).
+section content hash, so an index built from a copy of `docs/` is usable
+on the droplet, provided the vault did not change in between (and if it
+did, the incremental `vec-rebuild` on the droplet embeds only the changed
+docs).
+
+**The build machine must run the same CPU instruction set as the server
+when the graph is int8.** Dynamic int8 graphs requantize activations at
+every layer, and the float kernels around them (GELU, LayerNorm, softmax)
+differ between ARM NEON and x86 AVX2, so the differences compound.
+Measured with `model_quint8_avx2.onnx` on the same texts: an Apple M1 and
+the droplet's x86 vCPU agree at cosine 0.979–1.000, and the cross-encoder
+orders a 20-passage pool differently. An M1-built index queried with
+droplet query vectors therefore carries that extra noise. Build on the
+server, on another x86 AVX2 machine with the same CPU flags, or use the
+fp32 graph (`onnx/model.onnx`) on both machines, which stays consistent
+across architectures at the cost of more RAM and slower inference.
 
 ```bash
-# Mac, arm64 venv of the worktree with the onnx extra installed
-rsync -a root@<host>:/var/lib/amperstand/vault/docs/ /tmp/vault/docs/      # read-only copy
+# build machine: same CPU instruction set as the server, onnx extra installed
+rsync -a root@<host>:/var/lib/amperstand/vault/docs root@<host>:/var/lib/amperstand/vault/.store/by-id /tmp/vault/   # read-only copy; get() needs by-id
 export AMPERSTAND_DATA_DIR=/tmp/vault
-export AMPERSTAND_EMBED_PROVIDER=onnx AMPERSTAND_EMBED_ONNX_DIR=/path/to/granite-embedding-97m-multilingual-r2 \
+export AMPERSTAND_EMBED_PROVIDER=onnx AMPERSTAND_EMBED_MODEL=granite-embedding-97m-multilingual-r2 \
+       AMPERSTAND_EMBED_ONNX_DIR=/path/to/granite-embedding-97m-multilingual-r2 \
        AMPERSTAND_EMBED_ONNX_FILE=onnx/model_quint8_avx2.onnx AMPERSTAND_EMBED_DIM=384 \
-       AMPERSTAND_EMBED_ONNX_THREADS=4
-amperstand-admin vec-rebuild --force --env-file /dev/null                 # ~25 min with 4 threads on an M1
+       AMPERSTAND_EMBED_ONNX_MAX_TOKENS=1024 AMPERSTAND_EMBED_ONNX_THREADS=4
+amperstand-admin vec-rebuild --force --env-file /dev/null
 sqlite3 /tmp/vault/.store/vec.db 'select * from vec_meta_kv'              # check the stamp
 scp /tmp/vault/.store/vec.db root@<host>:/var/lib/amperstand/vault/.store/vec.db.new
 ```
+
+Set `AMPERSTAND_EMBED_MODEL` explicitly on both sides: without it the
+signature records the model directory's name, so two machines with
+differently named directories produce indexes that refuse each other.
+`vec-rebuild` embeds one doc per call, padded to its longest section; on
+a small machine expect roughly 2 sections/s.
 
 On the droplet (service user owns the file; swap atomically while the
 server is stopped, since sqlite-vec holds the file open):
@@ -392,7 +424,7 @@ Clients should treat
 `meta.fallback == "bm25"` and `meta.rerank_applied == false` as
 degraded-quality signals and label their results accordingly.
 
-## 8. Deploy steps (written, not executed)
+## 8. Deploy steps
 
 ### Nearby (c), in-process ONNX — the recommended option
 
@@ -400,38 +432,61 @@ degraded-quality signals and label their results accordingly.
    RAM-only resize keeps the disk; ~1 min downtime). Skipping this means
    the extra ~0.7–0.8 GB lands in swap and search latency becomes
    unpredictable.
-2. Pull the branch and install the extra:
+2. Install the extra's packages without touching what the shared venv
+   already has (the API, the Telegram bot and the email watcher share
+   `/opt/amperstand/venv`; an unpinned install upgrades `click` and others):
    ```bash
-   cd /opt/amperstand/amperstand-core && sudo -u amperstand git fetch && sudo -u amperstand git checkout feat/pluggable-embed-rerank
-   sudo -u amperstand /opt/amperstand/venv/bin/pip install -e '/opt/amperstand/amperstand-core[onnx]'
+   sudo -u amperstand /opt/amperstand/venv/bin/pip freeze | grep -v -e '^-e' -e '@ file' > /tmp/venv-constraints.txt
+   sudo -u amperstand /opt/amperstand/venv/bin/pip install -c /tmp/venv-constraints.txt 'onnxruntime>=1.17' 'tokenizers>=0.15'
    ```
-   (`onnxruntime` wheel ~15 MB for x86_64 Linux, `tokenizers` ~3 MB, `numpy` ~17 MB.)
+   This only adds packages (`onnxruntime`, `tokenizers`, `huggingface_hub`,
+   `protobuf`, `flatbuffers` and their small deps) and can run while the
+   server is up. `amperstand-core` is installed editable, so the code
+   switch itself is a `git checkout` while the server is stopped (step 6).
 3. Put the model files where the hardened unit can read them
-   (`ProtectSystem=strict`, `ReadWritePaths=/var/lib/amperstand`):
+   (`ProtectSystem=strict`, `ReadWritePaths=/var/lib/amperstand`),
+   downloading them on the droplet:
    ```bash
-   sudo -u amperstand mkdir -p /var/lib/amperstand/models
-   # from the Mac, the same files used for the eval:
-   scp -r granite-embedding-97m-multilingual-r2 mmarco-mMiniLMv2-L12-H384-v1 root@<host>:/var/lib/amperstand/models/
-   sudo chown -R amperstand:amperstand /var/lib/amperstand/models
+   M=/var/lib/amperstand/models
+   mkdir -p $M/granite-embedding-97m-multilingual-r2/onnx $M/mmarco-mMiniLMv2-L12-H384-v1/onnx && cd $M
+   for f in tokenizer.json onnx/model_quint8_avx2.onnx; do
+     curl -sSfL -o granite-embedding-97m-multilingual-r2/$f https://huggingface.co/ibm-granite/granite-embedding-97m-multilingual-r2/resolve/main/$f
+     curl -sSfL -o mmarco-mMiniLMv2-L12-H384-v1/$f https://huggingface.co/cross-encoder/mmarco-mMiniLMv2-L12-H384-v1/resolve/main/$f
+   done
+   chown -R amperstand:amperstand $M && sha256sum */onnx/*.onnx
    ```
    Needed files per model: `tokenizer.json`, `onnx/model_quint8_avx2.onnx`
-   (98 MB and 119 MB). Download them once on the Mac from
-   `huggingface.co/ibm-granite/granite-embedding-97m-multilingual-r2` and
-   `huggingface.co/cross-encoder/mmarco-mMiniLMv2-L12-H384-v1`.
+   (98 MB and 119 MB). If the index is built elsewhere, compare the
+   `sha256sum` output on both machines.
 4. Append the Nearby (c) block from §4 to `/etc/amperstand/env`
    (`sudo $EDITOR /etc/amperstand/env`). Keep `OPENAI_API_KEY` for chat and
    audio; it is no longer used by search.
-5. Build the index on the Mac and upload it (§6), or run
-   `vec-rebuild --force` on the droplet overnight.
-6. `sudo systemctl restart amperstand-server`, then check:
+5. Build the index on the droplet overnight, into a separate file and at
+   low priority so the bots keep their CPU. Running it as a transient unit
+   keeps it alive after logout, and the memory cap means an OOM kills only
+   the build:
+   ```bash
+   sudo systemd-run --unit=amperstand-vec-build --uid=amperstand --gid=amperstand \
+     -p Nice=19 -p CPUWeight=1 -p IOWeight=10 -p MemoryHigh=1100M -p MemoryMax=1300M \
+     /opt/amperstand/venv/bin/amperstand-admin vec-rebuild --force --env-file /etc/amperstand/env
+   ```
+   `vec-rebuild` writes to the live `vec.db`, so either stop the server
+   for the duration or build a copy with a script that opens
+   `VectorIndex(<other path>, signature=...)` and runs the same
+   `parse_sections → section_text_for_embedding → embed_batch →
+   upsert_doc_sections` loop. Alternatively, build on another machine
+   with the same CPU instruction set and upload (§6).
+6. Stop the server, back up `vec.db` (with `-wal`/`-shm`) and
+   `/etc/amperstand/env`, update `/opt/amperstand/amperstand-core` to a
+   `main` that includes this change, swap in the new `vec.db`, append
+   the env block, start the server, then check:
    ```bash
    sudo journalctl -u amperstand-server -n 50 | grep -E "vector search|rerank|onnx"
    curl -s -H "Authorization: Bearer $KEY" -X POST localhost:8765/vault/search/hybrid \
         -H 'content-type: application/json' -d '{"q":"test","limit":3,"rerank":true}' | jq .meta
    ```
-   Expect `embed_provider: "onnx"`, `rerank_applied: true`.
-7. Run `pytest` once on the droplet's venv? Not needed; run the suite on a
-   dev machine — the droplet only needs the smoke test above.
+   Expect `embed_provider: "onnx"`, `rerank_applied: true`. The models load
+   on the first search, so that request takes ~35 s.
 
 ### Nearby (a), TEI sidecar on the droplet
 
@@ -478,7 +533,7 @@ OpenAI setup nothing changes except that the branch must be deployed for
 the new error behaviour:
 
 ```bash
-cd /opt/amperstand/amperstand-core && sudo -u amperstand git fetch && sudo -u amperstand git checkout feat/pluggable-embed-rerank
+cd /opt/amperstand/amperstand-core && sudo -u amperstand git checkout main && sudo -u amperstand git pull
 sudo -u amperstand /opt/amperstand/venv/bin/pip install -e /opt/amperstand/amperstand-core
 sudo systemctl restart amperstand-server
 ```
@@ -489,14 +544,12 @@ on first start; no rebuild.
 ## 9. Local evaluation (Mac, Apple M1, arm64)
 
 Partial. Memory and single-thread latency of the in-process ONNX path
-were measured on one Apple M1 core and are reported in §5.
+were measured on one Apple M1 core and on the droplet's vCPU; both are
+reported in §5, including cross-encoder latency at pools of 20 and 40.
 
-Not yet run, and worth running before resizing the droplet for Nearby:
-
-- retrieval quality against the current OpenAI index: top-10 doc overlap
-  on a set of saved research queries, with and without the cross-encoder,
-  plus a few spot-checked queries where the results diverge;
-- cross-encoder latency at candidate pools of 20 and 40, single-threaded.
+Not run: retrieval quality against the OpenAI index (top-10
+doc overlap on a set of saved research queries, with and without the
+cross-encoder, plus a few spot-checked queries where the results diverge).
 
 ## 10. Recommendation
 
@@ -526,14 +579,15 @@ See §1. The ranking, for this vault and this droplet:
   use mocked HTTP with the documented shapes; TEI and Infinity shapes were
   checked against their published OpenAPI specs, Cohere/Jina/Voyage against
   their reference docs).
-- The in-process numbers are measured on an M1 core; the droplet's shared
-  x86 vCPU is slower per core (expect 2–4× on the same single-thread
-  path) and the `quint8_avx2` graph is the one tuned for it.
+- The droplet's shared x86 vCPU runs the single-thread path about 3.5×
+  slower than an M1 core (2.9 s vs 0.8 s for a 1024-token section).
+  int8 vectors are not portable between ARM and x86 (§6).
 - `ONNXEmbedder` and `ONNXCrossEncoderReranker` were exercised with the two
   default models only. The real-model smoke test is skipped unless
   `AMPERSTAND_TEST_ONNX_DIR` points at a downloaded model.
 - Retrieval quality of the Nearby defaults versus OpenAI on this vault is
-  not measured yet (§9).
+  not measured (§9). Scores from the two setups are on different scales
+  (both negated, lower is better); compare ranks, not scores.
 - Voyage's `/v1/embeddings` was implemented from its documentation; Mistral
   rejects `dimensions`, use `AMPERSTAND_EMBED_MATRYOSHKA=1` or the model's
   native dim.
