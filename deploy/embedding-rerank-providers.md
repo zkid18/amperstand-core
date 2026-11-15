@@ -123,6 +123,7 @@ All variables are read at process start (server) or at command start
 | `AMPERSTAND_RERANK_BASE_URL` | URL | Required for `openai_compatible`, `tei`, `infinity` (…`/rerank` is appended). Optional override for the vendors. |
 | `AMPERSTAND_RERANK_API_KEY` | secret | Falls back to `OPENAI_API_KEY`, `COHERE_API_KEY`, `JINA_API_KEY`, `VOYAGE_API_KEY`. |
 | `AMPERSTAND_RERANK_MAX_CHARS` | default `600` | Passage cap sent per candidate (unchanged). |
+| `AMPERSTAND_RERANK_MAX_CANDIDATES` | default `30` | How many of the top fused candidates are re-scored, whatever `limit` is. Rerank cost is linear in it (~0.4 s per passage for in-process ONNX on the 1 vCPU droplet). Results past it keep their fused order and `meta.warnings` says so. |
 | `AMPERSTAND_RERANK_TIMEOUT_S` | default `20` | HTTP timeout. |
 | `AMPERSTAND_RERANK_FAIL_MODE` | `soft` (default) / `hard` | `soft`: provider failure → fused order with `meta.rerank_applied=false` and a warning. `hard`: 503 `rerank_provider_unavailable`. |
 | `AMPERSTAND_RERANK_ONNX_DIR` / `_ONNX_FILE` / `_ONNX_THREADS` / `_ONNX_MAX_TOKENS` | path / `onnx/model.onnx` / `1` / `512` | `provider=onnx` only. |

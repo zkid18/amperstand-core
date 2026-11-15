@@ -26,6 +26,8 @@ Configuration (env):
   AMPERSTAND_RERANK_API_KEY     key; falls back to OPENAI_API_KEY / COHERE_API_KEY /
                                 JINA_API_KEY / VOYAGE_API_KEY
   AMPERSTAND_RERANK_MAX_CHARS   passage cap sent to the reranker (default 600)
+  AMPERSTAND_RERANK_MAX_CANDIDATES  how many of the top fused candidates are
+                                re-scored, whatever `limit` is (default 30)
   AMPERSTAND_RERANK_TIMEOUT_S   HTTP timeout (default 20)
   AMPERSTAND_RERANK_FAIL_MODE   soft (default) | hard
   AMPERSTAND_RERANK_ONNX_DIR / _ONNX_FILE / _ONNX_THREADS / _ONNX_MAX_TOKENS   (provider=onnx)
@@ -56,6 +58,14 @@ DEFAULT_LLM_MODEL = "gpt-4o-mini"
 # graded fairly, short enough that 30 candidates fit in one request.
 RERANK_MAX_CHARS = 600
 
+# How many of the top fused candidates the reranker scores. Rerank cost is
+# linear in this number, and the in-process cross-encoder on a 1 vCPU droplet
+# takes ~0.4 s per passage: before this cap, limit=15 sent 60 passages
+# (~30-45 s each), and a burst of those OOM-killed the server on 2026-11-13.
+# 30 is the pool small limits already used. Results past the cap keep their
+# fused order and the response says so.
+RERANK_MAX_CANDIDATES = 30
+
 KINDS = ("llm", "cross_encoder", "none")
 CROSS_ENCODER_PROVIDERS = ("tei", "infinity", "cohere", "jina", "voyage", "onnx")
 LLM_PROVIDERS = ("openai", "openai_compatible")
@@ -84,6 +94,9 @@ class RerankOutcome:
     applied: bool
     kind: str
     error: str | None = None
+    # How many of the top candidates were sent to the reranker; results
+    # past this position keep their fused order.
+    pool: int = 0
 
 
 # ── shared helpers ───────────────────────────────────────────────────
@@ -143,9 +156,16 @@ class BaseReranker:
     kind: str = "none"
     provider: str = "none"
 
-    def __init__(self, *, max_chars: int = RERANK_MAX_CHARS, fail_mode: str = "soft") -> None:
+    def __init__(
+        self,
+        *,
+        max_chars: int = RERANK_MAX_CHARS,
+        fail_mode: str = "soft",
+        max_candidates: int = RERANK_MAX_CANDIDATES,
+    ) -> None:
         self.max_chars = max_chars
         self.fail_mode = fail_mode
+        self.max_candidates = max(1, max_candidates)
 
     @property
     def available(self) -> bool:
@@ -168,7 +188,10 @@ class BaseReranker:
         candidates = list(candidates)
         if not candidates:
             return RerankOutcome([], applied=False, kind=self.kind)
-        items = _passages(candidates, body_lookup, self.max_chars)
+        # Score only the head; _apply_scores keeps the unscored tail in
+        # fused order after it.
+        head = candidates[: self.max_candidates]
+        items = _passages(head, body_lookup, self.max_chars)
         try:
             scores = self._score(query, items)
         except RerankError as exc:
@@ -183,7 +206,8 @@ class BaseReranker:
                 raise RerankError(msg)
             logger.warning("rerank: %s; returning fused order", msg)
             return RerankOutcome(candidates[:limit], applied=False, kind=self.kind, error=msg)
-        return RerankOutcome(_apply_scores(candidates, scores, limit), applied=True, kind=self.kind)
+        return RerankOutcome(_apply_scores(candidates, scores, limit), applied=True,
+                             kind=self.kind, pool=len(head))
 
     def _score(self, query: str, items: list[dict[str, Any]]) -> dict[int, float]:  # pragma: no cover
         raise NotImplementedError
@@ -464,6 +488,7 @@ class RerankConfig:
     base_url: str | None = None
     api_key: str | None = None
     max_chars: int = RERANK_MAX_CHARS
+    max_candidates: int = RERANK_MAX_CANDIDATES
     timeout_s: float = 20.0
     fail_mode: str = "soft"
     onnx_dir: str | None = None
@@ -505,9 +530,19 @@ def rerank_config_from_env(env: Mapping[str, str] | None = None) -> RerankConfig
     fail_mode = (g("AMPERSTAND_RERANK_FAIL_MODE", "soft") or "soft").lower()
     if fail_mode not in ("soft", "hard"):
         raise RerankError("AMPERSTAND_RERANK_FAIL_MODE must be soft|hard")
+    raw_cands = g("AMPERSTAND_RERANK_MAX_CANDIDATES", str(RERANK_MAX_CANDIDATES))
+    try:
+        max_candidates = int(raw_cands)
+    except ValueError:
+        max_candidates = 0
+    if max_candidates < 1:
+        raise RerankError(
+            f"AMPERSTAND_RERANK_MAX_CANDIDATES must be a positive integer, got {raw_cands!r}"
+        )
     return RerankConfig(
         kind=kind, provider=provider, model=model, base_url=base_url, api_key=api_key,
         max_chars=int(g("AMPERSTAND_RERANK_MAX_CHARS", str(RERANK_MAX_CHARS)) or RERANK_MAX_CHARS),
+        max_candidates=max_candidates,
         timeout_s=float(g("AMPERSTAND_RERANK_TIMEOUT_S", "20") or 20),
         fail_mode=fail_mode,
         onnx_dir=g("AMPERSTAND_RERANK_ONNX_DIR"),
@@ -518,7 +553,8 @@ def rerank_config_from_env(env: Mapping[str, str] | None = None) -> RerankConfig
 
 
 def build_reranker(cfg: RerankConfig, **overrides) -> BaseReranker:
-    common = dict(max_chars=cfg.max_chars, fail_mode=cfg.fail_mode)
+    common = dict(max_chars=cfg.max_chars, fail_mode=cfg.fail_mode,
+                  max_candidates=cfg.max_candidates)
     if cfg.kind == "none" or not rerank_enabled():
         return NoReranker(**common)
     if cfg.kind == "llm":
@@ -569,5 +605,7 @@ def rerank_with_llm(
     if not api_key:
         logger.warning("rerank: OPENAI_API_KEY not set; falling back to RRF order")
         return list(candidates)[:limit]
-    r = LLMReranker(api_key=api_key, model=model or RERANK_MODEL, base_url=base_url, fail_mode="soft")
+    # Pre-provider behaviour: grade every candidate the caller passed.
+    r = LLMReranker(api_key=api_key, model=model or RERANK_MODEL, base_url=base_url,
+                    fail_mode="soft", max_candidates=len(candidates))
     return r.rerank(query, candidates, body_lookup, limit=limit).results
