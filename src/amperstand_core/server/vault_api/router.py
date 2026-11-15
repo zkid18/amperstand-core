@@ -444,9 +444,11 @@ def search_hybrid(
     found to deceive callers about which retrieval mode they were
     actually getting.
 
-    When `rerank=True` the candidate pool is widened to ~4× `limit`, fused,
-    then re-scored by the configured reranker (LLM grader, a cross-encoder
-    sidecar, or a vendor rerank API) and re-sorted by relevance. If rerank
+    When `rerank=True` the candidate pool is widened to ~4× `limit` and
+    fused; the top AMPERSTAND_RERANK_MAX_CANDIDATES (default 30) of it are
+    re-scored by the configured reranker (LLM grader, a cross-encoder
+    sidecar, or a vendor rerank API) and re-sorted by relevance. Results
+    past that cap keep their fused order, with a warning in `meta`. If rerank
     was requested but isn't available, responds 503 rather than silently
     dropping the rerank stage. If the reranker fails mid-request the
     fused order is returned with `meta.rerank_applied=false` (or a 503
@@ -467,9 +469,9 @@ def search_hybrid(
                 ),
             },
         )
-    # When rerank is on, fetch a fatter candidate pool so the reranker has
-    # more options to reorder. ~4× limit (capped to 60) is a reasonable
-    # trade between coverage and prompt size.
+    # When rerank is on, retrieve deeper so fusion has more to work with
+    # (~4× limit, capped to 60). Retrieval is cheap; the reranker itself
+    # scores only its first `max_candidates` of the fused list.
     pool_size = (
         max(payload.limit * 4, 30) if use_rerank else max(payload.limit * 3, 30)
     )
@@ -521,6 +523,11 @@ def search_hybrid(
         meta.rerank_applied = outcome.applied
         if outcome.error:
             meta.warnings.append(f"rerank not applied: {outcome.error}")
+        elif outcome.applied and len(results) > outcome.pool:
+            meta.warnings.append(
+                f"rerank scored the top {outcome.pool} candidates; results after "
+                f"position {outcome.pool} keep their fused order"
+            )
     else:
         results = fused[:payload.limit]
     return SearchResponse(results=_to_hits(results), meta=meta)

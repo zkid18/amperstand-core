@@ -91,6 +91,26 @@ def test_voyage_shape_uses_top_k_and_data() -> None:
     assert seen[0].headers["authorization"] == "Bearer k"
 
 
+def test_only_the_top_max_candidates_are_scored() -> None:
+    looked: list[str] = []
+
+    def lookup(c: SearchResult) -> str:
+        looked.append(c.doc_id)
+        return f"body of {c.doc_id}"
+
+    def handler(r, b):
+        return httpx.Response(200, json=[{"index": 1, "score": 0.9}, {"index": 0, "score": 0.1}])
+
+    t, seen = _transport(handler)
+    rr = HTTPCrossEncoderReranker(provider="tei", base_url="http://h", transport=t, max_candidates=2)
+    out = rr.rerank("q", _cands(5), lookup, limit=4)
+    assert out.applied and out.pool == 2
+    assert len(json.loads(seen[0].content)["texts"]) == 2
+    assert looked == ["d0", "d1"]  # bodies are read for the head only
+    # reranked head first, then the tail in fused order
+    assert [r.doc_id for r in out.results] == ["d1", "d0", "d2", "d3"]
+
+
 def test_soft_failure_returns_fused_order_and_flags_it() -> None:
     t, _ = _transport(lambda r, b: httpx.Response(502, text="bad gateway"))
     rr = HTTPCrossEncoderReranker(provider="tei", base_url="http://h", transport=t)
@@ -182,6 +202,9 @@ def test_rerank_with_llm_backcompat(monkeypatch, stub_openai) -> None:
     assert [r.doc_id for r in rerank_with_llm("q", _cands(3), _lookup, limit=2)] == ["d0", "d1"]
     stub_openai.script = [{"scores": [{"id": 2, "score": 10}]}]
     assert [r.doc_id for r in rerank_with_llm("q", _cands(3), _lookup, limit=2, api_key="sk")] == ["d2", "d0"]
+    # The wrapper keeps grading every candidate it is given, past the default cap.
+    stub_openai.script = [{"scores": [{"id": 34, "score": 10}]}]
+    assert rerank_with_llm("q", _cands(35), _lookup, limit=1, api_key="sk")[0].doc_id == "d34"
 
 
 # ── config / factory ─────────────────────────────────────────────────
@@ -203,6 +226,17 @@ def test_rerank_config_validates_kind_provider_combos() -> None:
     cfg = rerank_config_from_env({"AMPERSTAND_RERANK_KIND": "cross-encoder", "COHERE_API_KEY": "c",
                                   "AMPERSTAND_RERANK_PROVIDER": "cohere", "AMPERSTAND_RERANK_MODEL": "rerank-v3.5"})
     assert cfg.kind == "cross_encoder" and cfg.api_key == "c"
+
+
+def test_rerank_max_candidates_config(monkeypatch) -> None:
+    monkeypatch.delenv("AMPERSTAND_RERANK_ENABLED", raising=False)
+    assert rerank_config_from_env({}).max_candidates == 30
+    assert rerank_config_from_env({"AMPERSTAND_RERANK_MAX_CANDIDATES": "40"}).max_candidates == 40
+    rr = build_reranker_from_env({"OPENAI_API_KEY": "sk", "AMPERSTAND_RERANK_MAX_CANDIDATES": "12"})
+    assert rr.max_candidates == 12
+    for bad in ("0", "-3", "many"):
+        with pytest.raises(RerankError, match="MAX_CANDIDATES"):
+            rerank_config_from_env({"AMPERSTAND_RERANK_MAX_CANDIDATES": bad})
 
 
 def test_factory_kinds(monkeypatch) -> None:

@@ -208,8 +208,33 @@ def test_cross_encoder_rerank_applied_and_reported(client, fake_embedder, monkey
     body = r.json()
     assert body["meta"]["rerank_requested"] and body["meta"]["rerank_applied"]
     assert body["meta"]["rerank_kind"] == "cross_encoder"
+    assert body["meta"]["warnings"] == []
     assert body["results"][0]["section_title"] == "Trains"
     assert seen and seen[0]["query"] == "apple"
+
+
+@needs_vec
+def test_results_past_the_rerank_cap_are_flagged(client, fake_embedder, monkeypatch) -> None:
+    _seed(client)
+    seen: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        seen.append(body)
+        return httpx.Response(200, json=[{"index": i, "score": 1.0} for i in range(len(body["texts"]))])
+
+    rr = HTTPCrossEncoderReranker(provider="tei", base_url="http://ce.invalid",
+                                  transport=httpx.MockTransport(handler), max_candidates=1)
+    monkeypatch.setattr(store_factory, "build_reranker_from_env", lambda: rr)
+    store_factory.reset_store_cache()
+    r = client.post("/vault/search/hybrid", headers=HEAD, json={"q": "apple", "limit": 2, "rerank": True})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert len(seen[0]["texts"]) == 1
+    assert body["meta"]["rerank_applied"] and len(body["results"]) == 2
+    assert body["meta"]["warnings"] == [
+        "rerank scored the top 1 candidates; results after position 1 keep their fused order"
+    ]
 
 
 @needs_vec

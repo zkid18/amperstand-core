@@ -30,6 +30,7 @@ The server reads its configuration from environment variables (typically via `/e
 | `AMPERSTAND_CHAT_MODEL` | `gpt-4o-mini` | Model used by the chat API (`POST /chat`) |
 | `AMPERSTAND_RERANK_MODEL` | `gpt-4o-mini` | Model used by hybrid-search rerank |
 | `AMPERSTAND_RERANK_ENABLED` | `1` | Set to `0`/`false`/`no` to disable rerank globally |
+| `AMPERSTAND_RERANK_MAX_CANDIDATES` | `30` | How many top hybrid-search candidates rerank re-scores, whatever `limit` is. Results past it keep their fused order, flagged in `meta.warnings` |
 
 Bumping `AMPERSTAND_CAPTURE_WORKERS` above 2–3 on a small droplet will trip the OOM-killer during a YouTube burst. Leave it at 1 unless you've sized for it.
 
