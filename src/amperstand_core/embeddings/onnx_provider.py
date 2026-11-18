@@ -27,6 +27,29 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_ONNX_FILE = "onnx/model.onnx"
 INSTALL_HINT = "install the optional extra: pip install 'amperstand-core[onnx]'"
+# Padded tokens per inference run. Attention memory grows with rows x length²:
+# one run over a long doc's 31 sections at 1024 tokens took the server from
+# ~470 MB to past 1.6 GB, where the kernel killed it. At 1024 a full-length
+# section adds ~50 MB, and on CPU larger runs are no faster.
+DEFAULT_MAX_BATCH_TOKENS = 1024
+
+
+def token_batches(lengths: list[int], max_tokens: int) -> list[list[int]]:
+    """Group indices so each run pads to at most `max_tokens` tokens.
+
+    Shortest first, so a group's padded size is its count times its last
+    length. A single text longer than the budget runs alone.
+    """
+    groups: list[list[int]] = []
+    cur: list[int] = []
+    for i in sorted(range(len(lengths)), key=lengths.__getitem__):
+        if cur and (len(cur) + 1) * lengths[i] > max_tokens:
+            groups.append(cur)
+            cur = []
+        cur.append(i)
+    if cur:
+        groups.append(cur)
+    return groups
 
 
 class ONNXEmbedder(BaseEmbedder):
@@ -42,6 +65,7 @@ class ONNXEmbedder(BaseEmbedder):
         pooling: str = "cls",
         threads: int = 1,
         max_model_tokens: int = 2048,
+        max_batch_tokens: int = DEFAULT_MAX_BATCH_TOKENS,
         normalize: bool = True,
         **kwargs,
     ) -> None:
@@ -61,6 +85,7 @@ class ONNXEmbedder(BaseEmbedder):
         self.pooling = pooling
         self.normalize = normalize
         self.max_model_tokens = max_model_tokens
+        self.max_batch_tokens = max(1, max_batch_tokens)
 
         tok_path = self.model_dir / "tokenizer.json"
         graph_path = self.model_dir / onnx_file
@@ -102,10 +127,20 @@ class ONNXEmbedder(BaseEmbedder):
         return d
 
     def _embed_raw(self, texts: list[str], *, kind: str) -> list[list[float]]:
+        try:
+            encs = self._tok.encode_batch(texts)
+        except Exception as exc:  # noqa: BLE001
+            raise EmbeddingError(f"onnx tokenization failed: {exc}") from exc
+        out: list[list[float]] = [[] for _ in encs]
+        for group in token_batches([len(e.ids) for e in encs], self.max_batch_tokens):
+            for i, vec in zip(group, self._run([encs[i] for i in group])):
+                out[i] = vec
+        return out
+
+    def _run(self, encs: list) -> list[list[float]]:
         import numpy as np
 
         try:
-            encs = self._tok.encode_batch(texts)
             L = max(len(e.ids) for e in encs)
             ids = np.full((len(encs), L), self._pad_id, dtype=np.int64)
             mask = np.zeros((len(encs), L), dtype=np.int64)

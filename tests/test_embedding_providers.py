@@ -359,3 +359,55 @@ def test_onnx_provider_smoke(monkeypatch) -> None:
     assert len(v1) == e.dim
     assert math.isclose(cos(v1, v1), 1.0, abs_tol=1e-4)
     assert cos(v1, v2) > cos(v1, v3)
+
+
+# ── ONNX run sizing (no model needed) ────────────────────────────────
+
+
+def test_token_batches_respects_budget_and_covers_every_index() -> None:
+    from amperstand_core.embeddings.onnx_provider import token_batches
+
+    lengths = [1024, 10, 1024, 300, 20, 1024, 5000, 600]
+    groups = token_batches(lengths, 2048)
+    assert sorted(i for g in groups for i in g) == list(range(len(lengths)))
+    for g in groups:
+        padded = len(g) * max(lengths[i] for i in g)
+        assert padded <= 2048 or len(g) == 1  # an over-budget text runs alone
+    assert [6] in groups
+    assert token_batches([], 2048) == []
+
+
+def test_onnx_embed_raw_splits_long_inputs_and_keeps_order() -> None:
+    np = pytest.importorskip("numpy")
+    from amperstand_core.embeddings.onnx_provider import ONNXEmbedder
+
+    class Enc:
+        def __init__(self, n: int, tag: int) -> None:
+            self.ids = [tag] * n
+
+    class Tok:
+        def encode_batch(self, texts):
+            return [Enc(int(t.split(":")[0]), int(t.split(":")[1])) for t in texts]
+
+    runs: list[tuple[int, int]] = []
+
+    class Sess:
+        def run(self, _names, feeds):
+            ids = feeds["input_ids"]
+            runs.append(ids.shape)
+            out = np.zeros((ids.shape[0], ids.shape[1], 2), dtype=np.float32)
+            out[:, 0, 0] = ids[:, 0]  # CLS vector carries the row's tag
+            out[:, 0, 1] = 1.0
+            return [out]
+
+    e = object.__new__(ONNXEmbedder)
+    e._tok, e._sess, e._pad_id = Tok(), Sess(), 0
+    e._input_names, e._output_name = {"input_ids", "attention_mask"}, "out"
+    e.pooling, e.normalize, e.max_batch_tokens = "cls", False, 2048
+
+    texts = [f"{n}:{tag}" for tag, n in enumerate([1024] * 31 + [12, 40], start=1)]
+    vectors = e._embed_raw(texts, kind="document")
+
+    assert [int(v[0]) for v in vectors] == list(range(1, 34))
+    assert all(rows * length <= 2048 for rows, length in runs)
+    assert len(runs) == 17  # the two short texts share a run; 31 long ones go in pairs
