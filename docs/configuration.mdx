@@ -49,6 +49,24 @@ pip install "amperstand-core[linkedin]"
 
 (The name is historical — the extra also covers Whisper for YouTube.)
 
+## Transcription
+
+[`POST /transcribe/jobs`](/api-reference/transcribe) and `amperstand capture-file` transcribe recordings on the server with [faster-whisper](https://github.com/SYSTRAN/faster-whisper). No API key is involved. Install the extra on the server, then restart it:
+
+```bash
+pip install "amperstand-core[transcribe]"
+```
+
+| Variable | Default | What |
+| --- | --- | --- |
+| `AMPERSTAND_TRANSCRIBE_MODEL` | `small` | faster-whisper model name (`tiny`, `base`, `small`, `medium`, …) or a local model directory |
+| `AMPERSTAND_TRANSCRIBE_THREADS` | all cores | CPU threads per job |
+| `AMPERSTAND_TRANSCRIBE_MAX_MB` | `500` | Largest upload accepted |
+
+The model downloads on the first job into the service user's Hugging Face cache (`~/.cache/huggingface`; about 500 MB for `small`). Jobs run one at a time, in a separate process at low CPU priority. If the server runs out of memory, the transcription is the first process the kernel stops.
+
+Sizing on a 1-vCPU, 2 GB server: `small` transcribes at about 1.2× real time and peaks around 600 MB of RAM for any length of recording. `base` is about 2.5× faster but much less accurate outside English.
+
 ## Outbound proxy (optional)
 
 Some hosts block bots from YouTube / X / LinkedIn. If you have a residential proxy, set:

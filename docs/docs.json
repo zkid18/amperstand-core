@@ -68,6 +68,7 @@
               "api-reference/curl-cookbook",
               "api-reference/capture",
               "api-reference/jobs",
+              "api-reference/transcribe",
               "api-reference/vault-docs",
               "api-reference/vault-search",
               "api-reference/feeds"

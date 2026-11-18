@@ -38,6 +38,7 @@ from amperstand_core.server.capture_jobs import (
 )
 from amperstand_core.server.chat_api import router as chat_router
 from amperstand_core.server.feed_api import router as feed_router
+from amperstand_core.server.transcribe_api import router as transcribe_router, runner as transcribe_runner
 from amperstand_core.server.vault_api import router as vault_router
 from amperstand_core.server.vault_api.auth import require_api_key
 from amperstand_core.server.vault_api.store_factory import get_store
@@ -384,9 +385,12 @@ def create_app(*, docs_visible: bool | None = None) -> FastAPI:
             asyncio.create_task(_capture_worker(stop, worker_id=i))
             for i in range(n_workers)
         ]
+        # Transcription jobs: resumes anything queued before a restart.
+        transcribe_runner.start()
         try:
             yield
         finally:
+            transcribe_runner.stop()
             # Graceful shutdown — F4 from the queue e2e report: the previous
             # 10s wait_for + task.cancel() was too aggressive; mid-fetch
             # jobs run on a thread that ignores asyncio cancellation, and
@@ -445,6 +449,7 @@ def create_app(*, docs_visible: bool | None = None) -> FastAPI:
     app.include_router(vault_router)
     app.include_router(feed_router)
     app.include_router(chat_router)
+    app.include_router(transcribe_router)
     app.include_router(web_router)
     mount_web_static(app)
 
