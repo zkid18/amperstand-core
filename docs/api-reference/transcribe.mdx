@@ -1,0 +1,105 @@
+---
+title: Transcribe
+description: "Upload a recording; the server transcribes it and saves the transcript."
+---
+
+The server transcribes audio and video with a local Whisper model and saves the result as a vault document. Jobs run one at a time, in upload order. Setup and speed: [Transcription](/configuration#transcription).
+
+## POST /transcribe/jobs
+
+The request body is the raw file. Query parameters describe it:
+
+| Parameter | Required | What |
+| --- | --- | --- |
+| `filename` | yes | Name of the uploaded file. Its extension must be one of `aac`, `flac`, `m4a`, `mkv`, `mov`, `mp3`, `mp4`, `mpeg`, `oga`, `ogg`, `opus`, `wav`, `webm` |
+| `original_name` | no | Name of the recording the audio came from, shown in the transcript. Default: `filename` |
+| `title` | no | Document title. Default: `original_name` without its extension |
+| `source` | no | URL where the recording is published. A transcript with the same `source` as an existing document updates that document |
+| `tags` | no | Repeat for several. `transcript` is always added |
+| `type` | no | `audio` (default) or `video`; becomes the document's `type` |
+| `language` | no | ISO 639-1 code. Default: detected from the opening minutes, then fixed for the whole recording |
+
+```bash
+curl -X POST -H "Authorization: Bearer $AMPERSTAND_API_KEY" \
+     --data-binary @talk.m4a \
+     "http://localhost:8765/transcribe/jobs?filename=talk.m4a&title=Team%20sync&language=en"
+```
+
+Upload audio only when you can: an hour of mono 32 kbps AAC is about 15 MB, where the source video can be gigabytes. `amperstand capture-file` does this with ffmpeg before uploading.
+
+### Response — `202 Accepted`
+
+```json
+{
+  "id": "1794921265-0b77719c",
+  "status": "queued",
+  "title": "Team sync",
+  "duration": 3605.2,
+  "queue_position": 1,
+  "doc_id": null,
+  "error": null
+}
+```
+
+### Errors
+
+| Status | `detail.error` | When |
+| --- | --- | --- |
+| `400` | `empty_body` | No bytes were uploaded |
+| `413` | `file_too_large` | Larger than `AMPERSTAND_TRANSCRIBE_MAX_MB` |
+| `415` | `unsupported_media_format` | `filename` has an extension not listed above |
+| `415` | `unreadable_media` | The file has no audio track or can't be decoded |
+| `503` | `transcription_unavailable` | The server lacks the `transcribe` extra |
+
+## GET /transcribe/jobs/{id}
+
+```bash
+curl -H "Authorization: Bearer $AMPERSTAND_API_KEY" \
+     http://localhost:8765/transcribe/jobs/1794921265-0b77719c
+```
+
+```json
+{
+  "id": "1794921265-0b77719c",
+  "status": "running",
+  "title": "Team sync",
+  "duration": 3605.2,
+  "done_seconds": 1210.4,
+  "doc_id": null,
+  "error": null,
+  "created": 1794921265.5,
+  "started": 1794921266.1,
+  "finished": null
+}
+```
+
+`duration` and `done_seconds` are seconds of audio; times are Unix timestamps. `queue_position` appears while `queued`, `done_seconds` while `running`.
+
+| Status | Means |
+| --- | --- |
+| `queued` | Waiting for the job ahead of it |
+| `running` | Transcribing |
+| `done` | Saved; `doc_id` is the transcript |
+| `failed` | See `error`. Submit the file again to retry |
+
+A job interrupted by a server restart starts over when the server comes back. The upload is deleted once the transcript is saved; a failed job keeps it in `<data dir>/.store/transcribe/<id>/` until removed by hand.
+
+## The transcript document
+
+The body opens with the file name, duration and language, then a `## Transcript` section with a `### H:MM:SS` heading every five minutes, so search results point at a position in the recording:
+
+```markdown
+**File**: talk.mp4
+**Duration**: 1:00:05
+**Language**: en
+
+## Transcript
+
+### 0:00:00
+
+Thanks for joining. Today we'll cover…
+
+### 0:05:00
+
+…
+```

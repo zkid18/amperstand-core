@@ -14,6 +14,7 @@ amperstand commands
 ```
 amperstand
 ├── capture       — Send a URL to the server for capture.
+├── capture-file  — Transcribe a local video or audio file into the vault.
 ├── commands      — Print every command in the CLI, in one flat tree.
 ├── config        — View and update local CLI configuration.
 │   ├── set       — Set a configuration value.
@@ -63,6 +64,24 @@ POSTs the URL to `/capture`. Server runs the right extractor and persists the ma
 | `--no-persist` | Extract only — don't save in the vault |
 
 For richer flows (async extraction, capture from pre-rendered HTML, capturing `.eml` files), call the [HTTP API](/api-reference/capture) directly.
+
+## Transcribe a recording
+
+```bash
+amperstand capture-file talk.mp4 --language ru --tag meetup
+```
+
+Extracts the audio with ffmpeg on your machine (mono AAC, 32 kbps), uploads it, and waits while the server transcribes it. The transcript is saved as a document tagged `transcript`, with a timestamp heading every five minutes. Needs `ffmpeg` and `ffprobe` on `PATH`, and the server's [transcription setup](/configuration#transcription).
+
+| Option | What |
+| --- | --- |
+| `--title` | Document title. Default: from the file name |
+| `--source <url>` | Where the recording is published. Capturing the same `--source` again updates that document |
+| `--tag` | Extra tag; repeat for more |
+| `--language` | Two-letter code (`en`, `ru`, …). Default: detected from the opening minutes |
+| `--no-wait` | Return once the job is queued |
+
+Ctrl-C stops waiting, not the job: the server finishes it and saves the transcript.
 
 ## Feeds
 
