@@ -75,6 +75,7 @@ class EmbedConfig:
     onnx_pooling: str = "cls"
     onnx_threads: int = 1
     onnx_max_tokens: int = 2048
+    onnx_max_batch_tokens: int = 1024
     extra: dict[str, str] = field(default_factory=dict)
 
     @property
@@ -139,6 +140,7 @@ def embed_config_from_env(env: Mapping[str, str] | None = None) -> EmbedConfig:
         onnx_pooling=(g("AMPERSTAND_EMBED_ONNX_POOLING", "cls") or "cls").lower(),
         onnx_threads=_int("AMPERSTAND_EMBED_ONNX_THREADS", 1),
         onnx_max_tokens=_int("AMPERSTAND_EMBED_ONNX_MAX_TOKENS", 2048),
+        onnx_max_batch_tokens=_int("AMPERSTAND_EMBED_ONNX_MAX_BATCH_TOKENS", 1024),
     )
 
 
@@ -179,7 +181,8 @@ def build_embedder(cfg: EmbedConfig, **overrides) -> BaseEmbedder | None:
         return ONNXEmbedder(
             model_dir=cfg.onnx_dir, onnx_file=cfg.onnx_file, model=cfg.model or None,
             pooling=cfg.onnx_pooling, threads=cfg.onnx_threads,
-            max_model_tokens=cfg.onnx_max_tokens, **common, **overrides,
+            max_model_tokens=cfg.onnx_max_tokens,
+            max_batch_tokens=cfg.onnx_max_batch_tokens, **common, **overrides,
         )
 
     from amperstand_core.embeddings import http_provider as hp
